@@ -1,31 +1,151 @@
 """
-FP8 Block-Scale Fused MoE Kernel  –  v5 (reference-exact for correctness baseline)
+FP8 Block-Scale Fused MoE Kernel  –  v6
 Definition: moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048
 
-This version is a direct port of the reference implementation wrapped in DPS.
-Goal: confirm correctness before adding optimisations back.
+Changes from v5 (reference-exact, all 19 workloads PASSED abs_err=0):
+  - GEMM1 + SwiGLU fused in Triton with on-the-fly FP8 dequant (no 3.7GB W13 expansion)
+  - GEMM2 uses per-expert lazy dequant (one expert at a time, not all 32 upfront)
+  - Routing identical to v5
 
-Differences from reference:
-  - DPS signature (output tensor passed in, not returned)
-  - Vectorised routing (no per-expert sel_mask.any() GPU→CPU sync)
-  - Single dispatch sort upfront (avoids per-expert index_select)
-  - Per-expert matmul uses slices (not index_select) → still GPU-async
-  - bf16 matmul (reference uses fp32)
+Design
+------
+  BLOCK_N = BLOCK_K = 128  (fixed to match FP8 block-scale granularity)
+  BLOCK_M = autotuned
+  W loaded as transposed tiles [BLOCK_K, BLOCK_N] for standard tl.dot layout
+  SwiGLU fused: each CTA accumulates gate and up separately → silu(up)*gate in epilogue
 """
 
 import torch
-import torch.nn.functional as F
+import triton
+import triton.language as tl
 
-# ── Problem constants ──────────────────────────────────────────────────────────
-_H      = 7168
-_I      = 2048
-_G1     = 4096
-_E_LOC  = 32
-_E_GLB  = 256
-_TOP_K  = 8
-_N_GRP  = 8
-_TK_GRP = 4
-_BLKSZ  = 128
+_H     = 7168
+_I     = 2048
+_G1    = 4096   # = 2 * _I
+_E_LOC = 32
+_E_GLB = 256
+_TOP_K = 8
+_N_GRP = 8
+_TK_GRP= 4
+_BLKSZ = 128
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GEMM1 + SwiGLU fused
+#   A  : [M, K]    fp8   (K = H = 7168)
+#   W  : [2N, K]   fp8   (N = I = 2048, first N rows = gate, last N = up)
+#   C  : [M, N]    fp32  (= silu(up) * gate)
+#   A_scale: [M, K//128]     f32
+#   W_scale: [2N//128, K//128] f32  (indices: [gate_blk|up_blk, k_blk])
+# ─────────────────────────────────────────────────────────────────────────────
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_M": bm}, num_warps=nw, num_stages=ns)
+        for bm in [16, 32, 64, 128]
+        for nw in [4, 8]
+        for ns in [2, 3, 4]
+    ],
+    key=["M", "K"],
+)
+@triton.jit
+def _gemm1_swiglu(
+    A_ptr, A_scale_ptr,
+    W_ptr, W_scale_ptr,
+    C_ptr,
+    M, N, K,
+    stride_am, stride_ak,
+    stride_wn, stride_wk,
+    stride_cm, stride_cn,
+    stride_asm, stride_ask,
+    stride_wsn, stride_wsk,
+    BLOCK_M: tl.constexpr,
+):
+    BLOCK_N: tl.constexpr = 128   # must equal _BLKSZ
+    BLOCK_K: tl.constexpr = 128   # must equal _BLKSZ
+
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)   # tile index over N (= I = 2048)
+
+    m_offs  = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    # gate weight rows: [pid_n*128 .. (pid_n+1)*128)
+    n_gate  = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    # up weight rows:   [N + pid_n*128 .. N + (pid_n+1)*128)
+    n_up    = n_gate + N
+
+    acc_g = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+    acc_u = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+
+    num_k_blks = K // BLOCK_K   # = 7168 // 128 = 56
+
+    for kb in range(num_k_blks):
+        k_offs = kb * BLOCK_K + tl.arange(0, BLOCK_K)
+
+        # ── A tile [BLOCK_M, BLOCK_K] ────────────────────────────────────────
+        a_ptrs = A_ptr + m_offs[:, None] * stride_am + k_offs[None, :] * stride_ak
+        a_tile = tl.load(a_ptrs, mask=m_offs[:, None] < M, other=0.0).to(tl.float32)
+
+        # A scale: [BLOCK_M]  one scale per row per 128-col block
+        a_scale = tl.load(
+            A_scale_ptr + m_offs * stride_asm + kb * stride_ask,
+            mask=m_offs < M, other=1.0,
+        )
+        a_tile = a_tile * a_scale[:, None]
+
+        # ── W_gate tile [BLOCK_K, BLOCK_N] (transposed load) ─────────────────
+        # W stored [2N, K]; we want tile at rows n_gate, cols k_offs → load [K, N]
+        wg_ptrs = W_ptr + n_gate[None, :] * stride_wn + k_offs[:, None] * stride_wk
+        wg_mask = n_gate[None, :] < N      # N is always in range for valid pid_n
+        wg_tile = tl.load(wg_ptrs, mask=wg_mask, other=0.0).to(tl.float32)
+        # W_gate scale: single scalar for this [128,128] block
+        wg_scale = tl.load(W_scale_ptr + pid_n * stride_wsn + kb * stride_wsk)
+        wg_tile  = wg_tile * wg_scale
+
+        # ── W_up tile [BLOCK_K, BLOCK_N] ─────────────────────────────────────
+        wu_ptrs = W_ptr + n_up[None, :] * stride_wn + k_offs[:, None] * stride_wk
+        wu_tile = tl.load(wu_ptrs, other=0.0).to(tl.float32)
+        # W_up scale: row-block index = pid_n + (N // BLOCK_N) = pid_n + 16
+        wu_scale = tl.load(
+            W_scale_ptr + (pid_n + N // BLOCK_N) * stride_wsn + kb * stride_wsk
+        )
+        wu_tile = wu_tile * wu_scale
+
+        # ── Accumulate ────────────────────────────────────────────────────────
+        acc_g = tl.dot(a_tile, wg_tile, acc_g, allow_tf32=False)
+        acc_u = tl.dot(a_tile, wu_tile, acc_u, allow_tf32=False)
+
+    # SwiGLU: silu(up) * gate   [matches v5 reference exactly]
+    result = (acc_u * tl.sigmoid(acc_u)) * acc_g
+
+    # Store [BLOCK_M, BLOCK_N]
+    c_ptrs = C_ptr + m_offs[:, None] * stride_cm + n_gate[None, :] * stride_cn
+    c_mask = (m_offs[:, None] < M) & (n_gate[None, :] < N)
+    tl.store(c_ptrs, result, mask=c_mask)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Routing (vectorised, matches v5 exactly)
+# ─────────────────────────────────────────────────────────────────────────────
+def _route(routing_logits, routing_bias, device, T):
+    s   = torch.sigmoid(routing_logits.to(torch.float32))
+    swb = s + routing_bias.to(torch.float32)
+
+    grouped = swb.view(T, _N_GRP, _E_GLB // _N_GRP)
+    top2, _ = grouped.topk(2, dim=2, largest=True, sorted=False)
+    gscores  = top2.sum(dim=2)
+
+    _, gidx  = gscores.topk(_TK_GRP, dim=1, largest=True, sorted=False)
+    gmask    = torch.zeros(T, _N_GRP, device=device)
+    gmask.scatter_(1, gidx, 1.0)
+    score_mask = gmask.unsqueeze(2).expand(T, _N_GRP, _E_GLB // _N_GRP).reshape(T, _E_GLB)
+
+    pruned      = swb.masked_fill(score_mask == 0, torch.finfo(torch.float32).min)
+    _, topk_idx = pruned.topk(_TOP_K, dim=1, largest=True, sorted=False)
+
+    M    = torch.zeros_like(s)
+    M.scatter_(1, topk_idx, 1.0)
+    w    = s * M
+    wsum = w.sum(dim=1, keepdim=True) + 1e-20
+    return topk_idx, w / wsum   # [T, 8], [T, 256]
 
 
 def kernel(
@@ -44,54 +164,14 @@ def kernel(
     T      = routing_logits.shape[0]
     device = hidden_states.device
 
-    # ── FP8 dequantisation (exact reference style) ─────────────────────────────
-    A_fp32 = hidden_states.to(torch.float32)                         # [T, H]
-    A_scale_TH = hidden_states_scale.to(torch.float32).permute(1, 0).contiguous()  # [T, 56]
-    A_scale_exp = (A_scale_TH.unsqueeze(-1)
-                              .repeat(1, 1, _BLKSZ)
-                              .reshape(T, _H))
-    A = A_fp32 * A_scale_exp                                         # [T, H] f32
+    # ── Routing ───────────────────────────────────────────────────────────────
+    topk_idx, weights_norm = _route(routing_logits, routing_bias, device, T)
+    weights_scaled = weights_norm * routed_scaling_factor   # [T, 256]
 
-    W13_fp32 = gemm1_weights.to(torch.float32)                       # [E, G1, H]
-    S13 = gemm1_weights_scale.to(torch.float32)                      # [E, 32, 56]
-    S13_exp = (torch.repeat_interleave(S13, _BLKSZ, dim=1)
-                    .repeat_interleave(_BLKSZ, dim=2))               # [E, G1, H]
-    W13 = W13_fp32 * S13_exp                                         # [E, G1, H] f32
+    # ── Hidden-state scale: [56, T] → [T, 56] ────────────────────────────────
+    A_scale = hidden_states_scale.to(torch.float32).permute(1, 0).contiguous()  # [T, 56]
 
-    W2_fp32 = gemm2_weights.to(torch.float32)                        # [E, H, I]
-    S2 = gemm2_weights_scale.to(torch.float32)                       # [E, 56, 16]
-    S2_exp = (torch.repeat_interleave(S2, _BLKSZ, dim=1)
-                   .repeat_interleave(_BLKSZ, dim=2))                # [E, H, I]
-    W2 = W2_fp32 * S2_exp                                            # [E, H, I] f32
-
-    # ── Routing (vectorised, matches reference exactly) ────────────────────────
-    logits = routing_logits.to(torch.float32)
-    bias   = routing_bias.to(torch.float32)
-
-    s   = torch.sigmoid(logits)            # [T, 256]
-    swb = s + bias                         # [T, 256]
-
-    g_sz    = _E_GLB // _N_GRP            # 32
-    grouped = swb.view(T, _N_GRP, g_sz)   # [T, 8, 32]
-    top2, _ = grouped.topk(2, dim=2, largest=True, sorted=False)
-    gscores = top2.sum(dim=2)             # [T, 8]
-
-    _, gidx = gscores.topk(_TK_GRP, dim=1, largest=True, sorted=False)
-    gmask   = torch.zeros(T, _N_GRP, device=device)
-    gmask.scatter_(1, gidx, 1.0)
-    score_mask = gmask.unsqueeze(2).expand(T, _N_GRP, g_sz).reshape(T, _E_GLB)
-
-    neg_inf = torch.finfo(torch.float32).min
-    pruned  = swb.masked_fill(score_mask == 0, neg_inf)
-    _, topk_idx = pruned.topk(_TOP_K, dim=1, largest=True, sorted=False)  # [T, 8]
-
-    M    = torch.zeros_like(s)
-    M.scatter_(1, topk_idx, 1.0)
-    w    = s * M
-    wsum = w.sum(dim=1, keepdim=True) + 1e-20
-    weights = (w / wsum) * routed_scaling_factor                     # [T, 256]
-
-    # ── Per-expert compute (reference loop, vectorised dispatch) ───────────────
+    # ── Output accumulator ────────────────────────────────────────────────────
     out_f32    = torch.zeros(T, _H, dtype=torch.float32, device=device)
     local_start = int(local_expert_offset)
 
@@ -100,27 +180,53 @@ def kernel(
         if ge < 0 or ge >= _E_GLB:
             continue
 
-        # Which tokens selected this expert?
-        sel = (topk_idx == ge).any(dim=1)     # [T] bool  (GPU→CPU sync via .any())
+        sel = (topk_idx == ge).any(dim=1)
         if not sel.any():
             continue
 
         tok_idx = sel.nonzero(as_tuple=False).squeeze(1)   # [Tk]
+        Tk      = tok_idx.shape[0]
 
-        A_e   = A.index_select(0, tok_idx)                 # [Tk, H]
-        W13_e = W13[le]                                     # [G1, H]
-        W2_e  = W2[le]                                      # [H, I]
+        # Token slice
+        A_e       = hidden_states[tok_idx]     # [Tk, H] fp8
+        A_scale_e = A_scale[tok_idx]           # [Tk, 56] f32, contiguous after index
 
-        G1_out = A_e.matmul(W13_e.t())                     # [Tk, G1]
+        # Per-expert weights (views into the fp8 tensors — no copy)
+        W13_e = gemm1_weights[le]              # [G1, H] = [4096, 7168] fp8
+        S13_e = gemm1_weights_scale[le]        # [32, 56] f32
 
-        X1 = G1_out[:, :_I]
-        X2 = G1_out[:, _I:]
-        silu_X2 = X2 / (1.0 + torch.exp(-X2))              # silu(X2)
-        C = silu_X2 * X1                                    # [Tk, I]
+        # ── GEMM1 + SwiGLU via Triton ─────────────────────────────────────────
+        C = torch.empty(Tk, _I, dtype=torch.float32, device=device)
 
-        O = C.matmul(W2_e.t())                              # [Tk, H]
+        grid = lambda meta: (
+            triton.cdiv(Tk, meta["BLOCK_M"]),
+            _I // 128,   # BLOCK_N=128, N=2048 → 16 tiles
+        )
 
-        w_tok = weights.index_select(0, tok_idx)[:, ge]    # [Tk]
+        _gemm1_swiglu[grid](
+            A_e, A_scale_e,
+            W13_e, S13_e,
+            C,
+            Tk, _I, _H,
+            A_e.stride(0), A_e.stride(1),
+            W13_e.stride(0), W13_e.stride(1),
+            C.stride(0), C.stride(1),
+            A_scale_e.stride(0), A_scale_e.stride(1),
+            S13_e.stride(0), S13_e.stride(1),
+        )
+
+        # ── GEMM2: C[Tk,I] × W2[H,I]ᵀ → [Tk,H] via cuBLAS ─────────────────
+        # Lazy per-expert dequant of W2 (avoids 1.9GB upfront expansion)
+        W2_e = gemm2_weights[le].to(torch.float32)    # [H, I]
+        S2_e = gemm2_weights_scale[le].to(torch.float32)  # [56, 16]
+        S2_exp = (S2_e.repeat_interleave(_BLKSZ, dim=0)
+                       .repeat_interleave(_BLKSZ, dim=1))  # [H, I]
+        W2_scaled = W2_e * S2_exp                         # [H, I]
+
+        O = torch.mm(C, W2_scaled.t())   # [Tk, I] @ [I, H] → [Tk, H]
+
+        # Routing weight and scatter-add
+        w_tok = weights_scaled[tok_idx, ge]             # [Tk]
         out_f32.index_add_(0, tok_idx, O * w_tok.unsqueeze(1))
 
     output.copy_(out_f32.to(torch.bfloat16))
