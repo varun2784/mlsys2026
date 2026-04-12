@@ -1,21 +1,23 @@
 """
-FP8 Block-Scale Fused MoE Kernel  –  v8b
+FP8 Block-Scale Fused MoE Kernel  –  v8c
 Definition: moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048
 
 v5  (reference, fp32):          19/19 PASSED, abs_err=0, ~1.0x
 v6f (fp32 cuBLAS + W cache):    19/19 PASSED, abs_err=0, ~0.93-0.99x
-v7  (Triton fp8 dequant→fp32):  19/19 PASSED, abs_err=0, ~0.93-0.99x
-v8  (explicit .to(tl.float8e4nv) cast): RUNTIME_ERROR all 19 — type name unsupported
+v7  (Triton fp8→fp32 dot):      19/19 PASSED, abs_err=0, ~0.93-0.99x
+v8  (.to(tl.float8e4nv) + fp8 dot):  RUNTIME_ERROR — dtype name unsupported
+v8b (native fp8 load + fp8 dot):     RUNTIME_ERROR — fp8 tl.dot unsupported
 
-v8b: drop explicit fp8 cast; let tl.load return native fp8 pointer dtype.
-  - tl.load from fp8 tensor → already fp8 in Triton IR
-  - tl.dot(fp8_tile, fp8_tile, out_dtype=tl.float32) — B200 FP8 GEMM units
-  - Block scales applied POST-dot to fp32 accumulator (mathematically exact)
-  - GEMM2 stays cuBLAS fp32 + W2 cache
-
-Math correctness:
-  acc[m,n] += dot(A_fp8, W_fp8^T)[m,n] * a_scale[m] * w_scale
-  = sum_k (A_fp8[m,k]*a_scale[m]) * (W_fp8[n,k]*w_scale)  ✓
+v8c: fp8 → fp16 → fp16 tensor core GEMM with fp32 accumulation.
+  WHY THIS IS EXACT:
+    fp8 E4M3 has 3 mantissa bits → conversion to fp16 (10 bits) is EXACT.
+    fp16 × fp16 products have ≤6 effective mantissa bits (3+3) → fits in
+    fp32 accumulator (23 bits) WITHOUT rounding → identical to fp32 GEMM.
+  WHY THIS IS FASTER:
+    fp16 WGMMA on B200: ~3× throughput vs fp32 non-tensor-core GEMM.
+    Also loads fp8 from HBM (938 MB W13 vs 3.75 GB fp32) → 4× less BW.
+  - Block scales still applied POST-dot to fp32 accumulator.
+  - GEMM2 stays cuBLAS fp32 + W2 cache.
 """
 
 import torch
@@ -102,10 +104,10 @@ def _gemm1_swiglu_fp8(
     for kb in range(K // BLOCK_K):   # 56 K-block iterations
         k_offs = kb * BLOCK_K + tl.arange(0, BLOCK_K)
 
-        # ── A tile [BLOCK_M, BLOCK_K] – load fp8, pass natively to tl.dot ────
+        # ── A tile [BLOCK_M, BLOCK_K]: fp8 → fp16 (exact) for tensor GEMM ────
         a_ptrs = A_ptr + m_offs[:, None] * stride_am + k_offs[None, :] * stride_ak
-        a_tile = tl.load(a_ptrs, mask=m_offs[:, None] < M, other=0)
-        # No .to() cast — tl.load from fp8 tensor returns fp8 dtype already
+        a_tile = tl.load(a_ptrs, mask=m_offs[:, None] < M, other=0).to(tl.float16)
+        # Conversion fp8→fp16 is EXACT: fp8 E4M3 ⊂ fp16, no rounding.
 
         # A scale: [BLOCK_M]  (one per row per K-block)
         a_scale = tl.load(
@@ -113,27 +115,26 @@ def _gemm1_swiglu_fp8(
             mask=m_offs < M, other=1.0,
         )
 
-        # ── W_gate tile [BLOCK_K, BLOCK_N] fp8 (transposed layout) ───────────
+        # ── W_gate tile [BLOCK_K, BLOCK_N]: fp8 → fp16 (exact) ──────────────
         wg_ptrs = W_ptr + n_gate[None, :] * stride_wn + k_offs[:, None] * stride_wk
-        wg_tile = tl.load(wg_ptrs, mask=n_gate[None, :] < N, other=0)
-        # No cast — native fp8 from load
+        wg_tile = tl.load(wg_ptrs, mask=n_gate[None, :] < N, other=0).to(tl.float16)
 
         # W_gate scale: single scalar for this 128×128 block
         wg_scale = tl.load(W_scale_ptr + pid_n * stride_wsn + kb * stride_wsk)
 
-        # ── W_up tile [BLOCK_K, BLOCK_N] fp8 (transposed layout) ─────────────
+        # ── W_up tile [BLOCK_K, BLOCK_N]: fp8 → fp16 (exact) ─────────────────
         wu_ptrs = W_ptr + n_up[None, :] * stride_wn + k_offs[:, None] * stride_wk
-        wu_tile = tl.load(wu_ptrs, other=0)
-        # No cast — native fp8 from load
+        wu_tile = tl.load(wu_ptrs, other=0).to(tl.float16)
 
         # W_up scale: N-block index shifted by N//BLOCK_N = 16
         wu_scale = tl.load(
             W_scale_ptr + (pid_n + N // BLOCK_N) * stride_wsn + kb * stride_wsk
         )
 
-        # ── Hardware FP8 GEMM → fp32, then apply block scales ────────────────
-        # math: acc += dot(A_fp8, W_fp8^T) * a_scale[:,None] * w_scale
-        # B200 FP8 tensor cores handle the dot; scales applied in fp32 epilogue
+        # ── fp16 WGMMA → fp32 accumulation, then apply block scales ──────────
+        # tl.dot(fp16, fp16, out_dtype=fp32): B200 fp16 tensor cores.
+        # Exact for fp8-derived inputs: product has ≤6 mantissa bits → fits
+        # in fp32 (23 bits) without rounding. Identical to fp32 GEMM.
         acc_g += tl.dot(a_tile, wg_tile, out_dtype=tl.float32) * a_scale[:, None] * wg_scale
         acc_u += tl.dot(a_tile, wu_tile, out_dtype=tl.float32) * a_scale[:, None] * wu_scale
 
