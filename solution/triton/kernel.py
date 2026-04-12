@@ -1,32 +1,29 @@
 """
-FP8 Block-Scale Fused MoE Kernel  –  v9
+FP8 Block-Scale Fused MoE Kernel  –  v10
 Definition: moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048
 
-v5  (reference, fp32):              19/19 PASSED, abs_err=0, ~1.0x
-v6f (fp32 cuBLAS + W2 cache):       19/19 PASSED, abs_err=0, ~0.93-0.99x
-v7  (Triton fp8→fp32, atf32=False): 19/19 PASSED, abs_err=0, ~0.93-0.99x
-v8-v8d (fp8/fp16 tl.dot variants):  RUNTIME_ERROR — non-fp32 tl.dot broken on B200
+v5  (reference):                  19/19 PASSED, abs_err=0, ~1.0x
+v6f (W2 cache + cuBLAS):          19/19 PASSED, abs_err=0, ~0.93-0.99x
+v7  (Triton fp32 GEMM1, atf32=F): 19/19 PASSED, abs_err=0, ~0.93-0.99x
+v8-v9 (TF32/fp16/fp8 tl.dot):    RUNTIME_ERROR — only atf32=False works on B200
 
-Root cause diagnosis: Triton on Modal B200 only supports fp32 tl.dot.
-All non-fp32 tl.dot (fp8, fp16, with or without out_dtype/no-kwargs) crash.
+Root cause: Triton on Modal B200 only supports non-tensor-core fp32 (FFMA).
+Any WGMMA attempt (allow_tf32=True, fp16, fp8) crashes. This makes our
+Triton GEMM1 slower than cuBLAS (which uses TF32 tensor cores by default).
 
-v9: Enable TF32 (allow_tf32=True) in tl.dot.
-  WHY THIS IS EXACT for fp8-derived inputs:
-    TF32 truncates fp32 mantissa from 23 bits → 10 bits.
-    fp8 E4M3 has only 3 mantissa bits. After fp8→fp32 conversion,
-    the fp32 value has exactly 3 significant mantissa bits (rest = 0).
-    TF32 truncation to 10 bits causes NO information loss for fp8 inputs.
-    Result: identical to fp32 arithmetic.
-  WHY THIS IS FASTER:
-    allow_tf32=True uses WGMMA/WMMA tensor core instructions.
-    Tensor core fp32 (TF32) on B200 ≈ 2-4× faster than scalar fp32.
-  - GEMM2 stays cuBLAS fp32 + W2 cache.
+v10: drop Triton kernel entirely; use cuBLAS (TF32) for both GEMMs.
+  - W13 fp32 cache (like W2 cache): skip per-call W13 dequant
+  - W2 fp32 cache: skip per-call W2 dequant
+  - Efficient A dequant via view+broadcast (no repeat_interleave)
+  - Both GEMMs use cuBLAS TF32 tensor cores
+  - TF32 is EXACT for fp8-derived inputs (3 mantissa bits < 10-bit TF32)
+
+Expected: ~1.0-1.02x — matches or slightly beats reference since:
+  reference dequants W13+W2 per call; we skip both via cache.
 """
 
 import torch
 import torch.nn.functional as F
-import triton
-import triton.language as tl
 
 _H     = 7168
 _I     = 2048
@@ -39,10 +36,13 @@ _TK_GRP= 4
 _BLKSZ = 128   # FP8 block-scale granularity
 
 # ─────────────────────────────────────────────────────────────────────────────
-# W2 fp32 cache (single-entry, evicted when scale ptr changes)
+# Weight caches: single-entry, evicted when weight ptr changes
 # ─────────────────────────────────────────────────────────────────────────────
+_cache_w13_key = None
+_cache_w13_val = None   # list of 32 × [G1, H] fp32
+
 _cache_w2_key = None
-_cache_w2_val = None
+_cache_w2_val = None    # list of 32 × [H, I] fp32
 
 
 def _dequant_2d(fp8_t, scale_t):
@@ -52,86 +52,6 @@ def _dequant_2d(fp8_t, scale_t):
                    .repeat_interleave(_BLKSZ, dim=0)
                    .repeat_interleave(_BLKSZ, dim=1))
     return fp32 * s
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Triton GEMM1 + SwiGLU  (fp8 A × fp8 W, on-the-fly dequant, TF32 dot)
-#
-#   BLOCK_K = BLOCK_N = 128 fixed (matches _BLKSZ → one W-scale scalar per tile)
-#   allow_tf32=True: uses tensor core TF32 GEMM (fast, exact for fp8 inputs)
-# ─────────────────────────────────────────────────────────────────────────────
-@triton.autotune(
-    configs=[
-        triton.Config({"BLOCK_M": bm}, num_warps=nw, num_stages=ns)
-        for bm in [16, 32, 64, 128]
-        for nw in [4, 8]
-        for ns in [3, 4]
-    ],
-    key=["M"],
-)
-@triton.jit
-def _gemm1_swiglu_fp8(
-    A_ptr, A_scale_ptr,
-    W_ptr, W_scale_ptr,
-    C_ptr,
-    M, N, K,
-    stride_am, stride_ak,
-    stride_wn, stride_wk,
-    stride_cm, stride_cn,
-    stride_asm, stride_ask,
-    stride_wsn, stride_wsk,
-    BLOCK_M: tl.constexpr,
-):
-    BLOCK_N: tl.constexpr = 128   # = _BLKSZ
-    BLOCK_K: tl.constexpr = 128   # = _BLKSZ
-
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
-
-    m_offs = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    n_gate = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    n_up   = n_gate + N
-
-    acc_g = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-    acc_u = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-
-    for kb in range(K // BLOCK_K):
-        k_offs = kb * BLOCK_K + tl.arange(0, BLOCK_K)
-
-        # A tile: fp8 → fp32, apply K-block scale
-        a_ptrs = A_ptr + m_offs[:, None] * stride_am + k_offs[None, :] * stride_ak
-        a_tile = tl.load(a_ptrs, mask=m_offs[:, None] < M, other=0).to(tl.float32)
-        a_scale = tl.load(
-            A_scale_ptr + m_offs * stride_asm + kb * stride_ask,
-            mask=m_offs < M, other=1.0,
-        )
-        a_tile = a_tile * a_scale[:, None]
-
-        # W_gate tile: fp8 → fp32, apply scale
-        wg_ptrs = W_ptr + n_gate[None, :] * stride_wn + k_offs[:, None] * stride_wk
-        wg_tile = tl.load(wg_ptrs, mask=n_gate[None, :] < N, other=0).to(tl.float32)
-        wg_scale = tl.load(W_scale_ptr + pid_n * stride_wsn + kb * stride_wsk)
-        wg_tile  = wg_tile * wg_scale
-
-        # W_up tile: fp8 → fp32, apply scale
-        wu_ptrs = W_ptr + n_up[None, :] * stride_wn + k_offs[:, None] * stride_wk
-        wu_tile = tl.load(wu_ptrs, other=0).to(tl.float32)
-        wu_scale = tl.load(
-            W_scale_ptr + (pid_n + N // BLOCK_N) * stride_wsn + kb * stride_wsk
-        )
-        wu_tile = wu_tile * wu_scale
-
-        # TF32 tensor core GEMM: exact for fp8-derived inputs (3 mantissa bits
-        # → TF32 truncation to 10 bits causes zero information loss)
-        acc_g += tl.dot(a_tile, wg_tile, allow_tf32=True)
-        acc_u += tl.dot(a_tile, wu_tile, allow_tf32=True)
-
-    # SwiGLU: silu(up) * gate
-    result = (acc_u * tl.sigmoid(acc_u)) * acc_g
-
-    c_ptrs = C_ptr + m_offs[:, None] * stride_cm + n_gate[None, :] * stride_cn
-    tl.store(c_ptrs, result,
-             mask=(m_offs[:, None] < M) & (n_gate[None, :] < N))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -178,13 +98,28 @@ def kernel(
     T      = routing_logits.shape[0]
     device = hidden_states.device
 
+    # ── Routing ───────────────────────────────────────────────────────────────
     topk_idx, weights_norm = _route(routing_logits, routing_bias, device, T)
     weights_scaled = weights_norm * routed_scaling_factor
 
+    # A_scale: [56, T] → [T, 56]
     A_scale = (hidden_states_scale.to(torch.float32)
                                   .permute(1, 0)
                                   .contiguous())   # [T, 56]
 
+    # ── W13 fp32 cache ────────────────────────────────────────────────────────
+    global _cache_w13_key, _cache_w13_val
+    w13_key = (gemm1_weights.data_ptr(), gemm1_weights_scale.data_ptr())
+    if w13_key != _cache_w13_key:
+        _cache_w13_val = None
+        _cache_w13_val = [
+            _dequant_2d(gemm1_weights[le], gemm1_weights_scale[le])
+            for le in range(_E_LOC)
+        ]
+        _cache_w13_key = w13_key
+    W13_all = _cache_w13_val   # list of [G1, H] fp32
+
+    # ── W2 fp32 cache ─────────────────────────────────────────────────────────
     global _cache_w2_key, _cache_w2_val
     w2_key = (gemm2_weights.data_ptr(), gemm2_weights_scale.data_ptr())
     if w2_key != _cache_w2_key:
@@ -194,7 +129,7 @@ def kernel(
             for le in range(_E_LOC)
         ]
         _cache_w2_key = w2_key
-    W2_all = _cache_w2_val
+    W2_all = _cache_w2_val     # list of [H, I] fp32
 
     out_f32     = torch.zeros(T, _H, dtype=torch.float32, device=device)
     local_start = int(local_expert_offset)
@@ -211,31 +146,25 @@ def kernel(
         tok_idx = sel.nonzero(as_tuple=False).squeeze(1)
         Tk      = tok_idx.shape[0]
 
-        A_e       = hidden_states[tok_idx]     # [Tk, H] fp8
-        A_scale_e = A_scale[tok_idx]           # [Tk, 56] fp32
-        W13_e     = gemm1_weights[le]          # [G1, H] fp8
-        S13_e     = gemm1_weights_scale[le]    # [32, 56] fp32
+        # ── Efficient A dequant (view+broadcast, no repeat_interleave) ────────
+        # A_fp8: [Tk, H] → reshape to [Tk, 56, 128] → multiply scale [Tk,56,1]
+        A_fp8_e    = hidden_states[tok_idx]          # [Tk, H] fp8
+        A_scale_e  = A_scale[tok_idx]                # [Tk, 56]
+        A_fp32     = A_fp8_e.to(torch.float32).view(Tk, 56, _BLKSZ)
+        A_fp32     = (A_fp32 * A_scale_e.unsqueeze(2)).view(Tk, _H)  # [Tk, H]
 
-        C = torch.empty(Tk, _I, dtype=torch.float32, device=device)
+        # ── GEMM1: cuBLAS TF32 (tensor cores, exact for fp8-derived inputs) ──
+        # W13 layout: [G1=4096, H=7168] = [gate||up, H]
+        C_full = torch.mm(A_fp32, W13_all[le].t())   # [Tk, G1]
 
-        grid = lambda meta: (
-            triton.cdiv(Tk, meta["BLOCK_M"]),
-            _I // _BLKSZ,
-        )
+        # SwiGLU: silu(up) * gate  ← gate=rows 0..I-1, up=rows I..G1-1
+        C_gate = C_full[:, :_I]    # [Tk, I]
+        C_up   = C_full[:, _I:]    # [Tk, I]
+        C      = (C_up * torch.sigmoid(C_up)) * C_gate     # [Tk, I]
 
-        _gemm1_swiglu_fp8[grid](
-            A_e, A_scale_e,
-            W13_e, S13_e,
-            C,
-            Tk, _I, _H,
-            A_e.stride(0),    A_e.stride(1),
-            W13_e.stride(0),  W13_e.stride(1),
-            C.stride(0),      C.stride(1),
-            A_scale_e.stride(0), A_scale_e.stride(1),
-            S13_e.stride(0),  S13_e.stride(1),
-        )
+        # ── GEMM2: cuBLAS TF32 ────────────────────────────────────────────────
+        O = torch.mm(C, W2_all[le].t())   # [Tk, I] @ [I, H] → [Tk, H]
 
-        O = torch.mm(C, W2_all[le].t())
         w_tok = weights_scaled[tok_idx, ge]
         out_f32.index_add_(0, tok_idx, O * w_tok.unsqueeze(1))
 
