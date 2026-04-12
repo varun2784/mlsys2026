@@ -1,22 +1,22 @@
 """
-FP8 Block-Scale Fused MoE Kernel  –  v8c
+FP8 Block-Scale Fused MoE Kernel  –  v8d
 Definition: moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048
 
-v5  (reference, fp32):          19/19 PASSED, abs_err=0, ~1.0x
-v6f (fp32 cuBLAS + W cache):    19/19 PASSED, abs_err=0, ~0.93-0.99x
-v7  (Triton fp8→fp32 dot):      19/19 PASSED, abs_err=0, ~0.93-0.99x
-v8  (.to(tl.float8e4nv) + fp8 dot):  RUNTIME_ERROR — dtype name unsupported
-v8b (native fp8 load + fp8 dot):     RUNTIME_ERROR — fp8 tl.dot unsupported
+v5  (reference, fp32):             19/19 PASSED, abs_err=0, ~1.0x
+v6f (fp32 cuBLAS + W cache):       19/19 PASSED, abs_err=0, ~0.93-0.99x
+v7  (Triton fp8→fp32 dot):         19/19 PASSED, abs_err=0, ~0.93-0.99x
+v8  (fp8 tl.dot, out_dtype=fp32):  RUNTIME_ERROR all 19
+v8b (fp8 native, out_dtype=fp32):  RUNTIME_ERROR all 19
+v8c (fp16, out_dtype=fp32):        RUNTIME_ERROR all 19
 
-v8c: fp8 → fp16 → fp16 tensor core GEMM with fp32 accumulation.
-  WHY THIS IS EXACT:
-    fp8 E4M3 has 3 mantissa bits → conversion to fp16 (10 bits) is EXACT.
-    fp16 × fp16 products have ≤6 effective mantissa bits (3+3) → fits in
-    fp32 accumulator (23 bits) WITHOUT rounding → identical to fp32 GEMM.
-  WHY THIS IS FASTER:
-    fp16 WGMMA on B200: ~3× throughput vs fp32 non-tensor-core GEMM.
-    Also loads fp8 from HBM (938 MB W13 vs 3.75 GB fp32) → 4× less BW.
-  - Block scales still applied POST-dot to fp32 accumulator.
+Common factor in all failures: out_dtype=tl.float32 in tl.dot.
+v7 uses allow_tf32=False and works.
+
+v8d: fp16 tiles, bare tl.dot() with no kwargs, explicit .to(fp32) post-dot.
+  - Avoids out_dtype= entirely — tests if that parameter is the crash cause.
+  - tl.dot(fp16, fp16) on B200 WGMMA → fp32 accumulation by default.
+  - fp8→fp16 conversion is EXACT (fp8 E4M3 ⊂ fp16).
+  - Post-dot .to(fp32) ensures we scale in fp32 → identical results to v7.
   - GEMM2 stays cuBLAS fp32 + W2 cache.
 """
 
@@ -52,19 +52,21 @@ def _dequant_2d(fp8_t, scale_t):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Triton GEMM1 + SwiGLU  –  hardware FP8 GEMM via tl.dot(fp8, fp8, fp32)
+# Triton GEMM1 + SwiGLU
 #
 #   A   : [M, K]    fp8   K = H = 7168
 #   W   : [2N, K]   fp8   N = I = 2048  (rows 0..N-1 = gate, N..2N-1 = up)
-#   C   : [M, N]    fp32  = silu(gate) * up   (SwiGLU)
-#   A_scale : [M, K//128]       fp32   per-(token, K-block) scale
-#   W_scale : [2N//128, K//128] fp32   per-(N-block, K-block) scale
+#   C   : [M, N]    fp32  = silu(up) * gate
 #
-#   BLOCK_K = BLOCK_N = 128 (matches _BLKSZ → one W-scale scalar per tile)
+#   Strategy: load fp8 tiles → convert to fp16 (exact) → tl.dot with no
+#   extra kwargs → .to(fp32) → apply block scales → accumulate.
 #
-#   Post-dot scaling:
-#     acc_g += tl.dot(a_fp8, wg_fp8, out_dtype=fp32) * a_scale[:,None] * wg_scale
-#   → uses B200 FP8 tensor cores; scales applied after the hardware multiply.
+#   Why fp8→fp16 is exact: fp8 E4M3 has 3 mantissa bits, fp16 has 10.
+#   fp8 ⊂ fp16, so no rounding occurs during conversion.
+#
+#   Why tl.dot(fp16,fp16) with no out_dtype: avoids the out_dtype= parameter
+#   that caused RUNTIME_ERROR in v8/v8b/v8c. The result is cast to fp32 via
+#   .to(tl.float32) before accumulation.
 # ─────────────────────────────────────────────────────────────────────────────
 @triton.autotune(
     configs=[
@@ -104,10 +106,9 @@ def _gemm1_swiglu_fp8(
     for kb in range(K // BLOCK_K):   # 56 K-block iterations
         k_offs = kb * BLOCK_K + tl.arange(0, BLOCK_K)
 
-        # ── A tile [BLOCK_M, BLOCK_K]: fp8 → fp16 (exact) for tensor GEMM ────
+        # ── A tile [BLOCK_M, BLOCK_K]: fp8 → fp16 (exact conversion) ─────────
         a_ptrs = A_ptr + m_offs[:, None] * stride_am + k_offs[None, :] * stride_ak
         a_tile = tl.load(a_ptrs, mask=m_offs[:, None] < M, other=0).to(tl.float16)
-        # Conversion fp8→fp16 is EXACT: fp8 E4M3 ⊂ fp16, no rounding.
 
         # A scale: [BLOCK_M]  (one per row per K-block)
         a_scale = tl.load(
@@ -131,12 +132,11 @@ def _gemm1_swiglu_fp8(
             W_scale_ptr + (pid_n + N // BLOCK_N) * stride_wsn + kb * stride_wsk
         )
 
-        # ── fp16 WGMMA → fp32 accumulation, then apply block scales ──────────
-        # tl.dot(fp16, fp16, out_dtype=fp32): B200 fp16 tensor cores.
-        # Exact for fp8-derived inputs: product has ≤6 mantissa bits → fits
-        # in fp32 (23 bits) without rounding. Identical to fp32 GEMM.
-        acc_g += tl.dot(a_tile, wg_tile, out_dtype=tl.float32) * a_scale[:, None] * wg_scale
-        acc_u += tl.dot(a_tile, wu_tile, out_dtype=tl.float32) * a_scale[:, None] * wu_scale
+        # ── tl.dot with NO kwargs (avoids out_dtype= crash), cast to fp32 ────
+        # On B200, tl.dot(fp16, fp16) uses WGMMA and accumulates in fp32.
+        # .to(tl.float32) ensures fp32 before scale application.
+        acc_g += tl.dot(a_tile, wg_tile).to(tl.float32) * a_scale[:, None] * wg_scale
+        acc_u += tl.dot(a_tile, wu_tile).to(tl.float32) * a_scale[:, None] * wu_scale
 
     # SwiGLU: silu(up) * gate  (matches v5 reference exactly)
     result = (acc_u * tl.sigmoid(acc_u)) * acc_g
@@ -231,11 +231,11 @@ def kernel(
         A_e       = hidden_states[tok_idx]     # [Tk, H] fp8
         A_scale_e = A_scale[tok_idx]           # [Tk, 56] fp32
 
-        # fp8 W13 slice and its scales (no fp32 expansion needed)
+        # fp8 W13 slice and its scales
         W13_e  = gemm1_weights[le]              # [G1, H] fp8  (view, no copy)
         S13_e  = gemm1_weights_scale[le]        # [32, 56] fp32
 
-        # ── GEMM1 + SwiGLU via Triton (hardware FP8 tensor cores) ────────────
+        # ── GEMM1 + SwiGLU via Triton ─────────────────────────────────────────
         C = torch.empty(Tk, _I, dtype=torch.float32, device=device)
 
         grid = lambda meta: (
