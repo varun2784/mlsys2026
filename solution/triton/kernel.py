@@ -105,7 +105,8 @@ def kernel(
     # ── Single-entry weight cache (evict on data_ptr change) ─────────────────────
     global _cache_w13_key, _cache_w13_val, _cache_w2_key, _cache_w2_val
 
-    w13_key = gemm1_weights.data_ptr()
+    # Include scale ptr in key to avoid ABA problem when allocator recycles buffers
+    w13_key = (gemm1_weights.data_ptr(), gemm1_weights_scale.data_ptr())
     if w13_key != _cache_w13_key:
         _cache_w13_val = None                 # release old tensors back to CUDA pool
         _cache_w13_val = [
@@ -114,7 +115,7 @@ def kernel(
         ]
         _cache_w13_key = w13_key
 
-    w2_key = gemm2_weights.data_ptr()
+    w2_key = (gemm2_weights.data_ptr(), gemm2_weights_scale.data_ptr())
     if w2_key != _cache_w2_key:
         _cache_w2_val = None
         _cache_w2_val = [
