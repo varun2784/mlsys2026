@@ -1,25 +1,23 @@
 """
-FP8 Block-Scale Fused MoE Kernel  –  v10
+FP8 Block-Scale Fused MoE Kernel  –  v10b
 Definition: moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048
 
 v5  (reference):                  19/19 PASSED, abs_err=0, ~1.0x
 v6f (W2 cache + cuBLAS):          19/19 PASSED, abs_err=0, ~0.93-0.99x
 v7  (Triton fp32 GEMM1, atf32=F): 19/19 PASSED, abs_err=0, ~0.93-0.99x
 v8-v9 (TF32/fp16/fp8 tl.dot):    RUNTIME_ERROR — only atf32=False works on B200
+v10 (W13+W2 cache + cuBLAS TF32): 19/19 PASSED, 0.92-0.98x BUT large abs_err
+    → W13 cache hits ABA problem (benchmark reuses memory addresses)
 
-Root cause: Triton on Modal B200 only supports non-tensor-core fp32 (FFMA).
-Any WGMMA attempt (allow_tf32=True, fp16, fp8) crashes. This makes our
-Triton GEMM1 slower than cuBLAS (which uses TF32 tensor cores by default).
+v10b: drop W13 cache (ABA-unsafe at 3.75 GB scale), keep W2 cache.
+  - Per-call W13 dequant via efficient view+broadcast (no repeat_interleave)
+  - Per-call A dequant via view+broadcast
+  - cuBLAS TF32 for GEMM1 (tensor cores, faster than Triton FFMA)
+  - W2 fp32 cache (safe — smaller and ABA-protected with composite key)
+  - cuBLAS TF32 for GEMM2
 
-v10: drop Triton kernel entirely; use cuBLAS (TF32) for both GEMMs.
-  - W13 fp32 cache (like W2 cache): skip per-call W13 dequant
-  - W2 fp32 cache: skip per-call W2 dequant
-  - Efficient A dequant via view+broadcast (no repeat_interleave)
-  - Both GEMMs use cuBLAS TF32 tensor cores
-  - TF32 is EXACT for fp8-derived inputs (3 mantissa bits < 10-bit TF32)
-
-Expected: ~1.0-1.02x — matches or slightly beats reference since:
-  reference dequants W13+W2 per call; we skip both via cache.
+Efficient dequant: view+broadcast instead of repeat_interleave avoids large
+intermediate scale tensors and is better for cache utilization.
 """
 
 import torch
@@ -36,11 +34,9 @@ _TK_GRP= 4
 _BLKSZ = 128   # FP8 block-scale granularity
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Weight caches: single-entry, evicted when weight ptr changes
+# W2 fp32 cache — single-entry, ABA-safe composite key
+# (W13 cache dropped: too large at 3.75 GB → ABA false matches in benchmark)
 # ─────────────────────────────────────────────────────────────────────────────
-_cache_w13_key = None
-_cache_w13_val = None   # list of 32 × [G1, H] fp32
-
 _cache_w2_key = None
 _cache_w2_val = None    # list of 32 × [H, I] fp32
 
@@ -107,18 +103,6 @@ def kernel(
                                   .permute(1, 0)
                                   .contiguous())   # [T, 56]
 
-    # ── W13 fp32 cache ────────────────────────────────────────────────────────
-    global _cache_w13_key, _cache_w13_val
-    w13_key = (gemm1_weights.data_ptr(), gemm1_weights_scale.data_ptr())
-    if w13_key != _cache_w13_key:
-        _cache_w13_val = None
-        _cache_w13_val = [
-            _dequant_2d(gemm1_weights[le], gemm1_weights_scale[le])
-            for le in range(_E_LOC)
-        ]
-        _cache_w13_key = w13_key
-    W13_all = _cache_w13_val   # list of [G1, H] fp32
-
     # ── W2 fp32 cache ─────────────────────────────────────────────────────────
     global _cache_w2_key, _cache_w2_val
     w2_key = (gemm2_weights.data_ptr(), gemm2_weights_scale.data_ptr())
@@ -146,16 +130,22 @@ def kernel(
         tok_idx = sel.nonzero(as_tuple=False).squeeze(1)
         Tk      = tok_idx.shape[0]
 
-        # ── Efficient A dequant (view+broadcast, no repeat_interleave) ────────
-        # A_fp8: [Tk, H] → reshape to [Tk, 56, 128] → multiply scale [Tk,56,1]
-        A_fp8_e    = hidden_states[tok_idx]          # [Tk, H] fp8
-        A_scale_e  = A_scale[tok_idx]                # [Tk, 56]
-        A_fp32     = A_fp8_e.to(torch.float32).view(Tk, 56, _BLKSZ)
-        A_fp32     = (A_fp32 * A_scale_e.unsqueeze(2)).view(Tk, _H)  # [Tk, H]
+        # ── Efficient A dequant: view+broadcast, no repeat_interleave ────────
+        A_fp8_e   = hidden_states[tok_idx]          # [Tk, H] fp8
+        A_scale_e = A_scale[tok_idx]                # [Tk, 56]
+        A_fp32    = A_fp8_e.to(torch.float32).view(Tk, 56, _BLKSZ)
+        A_fp32    = (A_fp32 * A_scale_e.unsqueeze(2)).view(Tk, _H)  # [Tk, H]
 
-        # ── GEMM1: cuBLAS TF32 (tensor cores, exact for fp8-derived inputs) ──
-        # W13 layout: [G1=4096, H=7168] = [gate||up, H]
-        C_full = torch.mm(A_fp32, W13_all[le].t())   # [Tk, G1]
+        # ── Efficient W13 dequant: view+broadcast per call (no cache, no ABA) ─
+        S13_e   = gemm1_weights_scale[le]           # [32, 56] fp32
+        W13_fp32 = gemm1_weights[le].to(torch.float32)       # [G1, H]
+        # Reshape to [G1//128, 128, H//128, 128] = [32, 128, 56, 128]
+        W13_fp32 = W13_fp32.view(_G1 // _BLKSZ, _BLKSZ, _H // _BLKSZ, _BLKSZ)
+        # S13_e [32, 56] → [32, 1, 56, 1] broadcasts over [32, 128, 56, 128]
+        W13_fp32 = (W13_fp32 * S13_e.unsqueeze(1).unsqueeze(3)).view(_G1, _H)
+
+        # ── GEMM1: cuBLAS TF32 tensor cores (exact for fp8-derived inputs) ───
+        C_full = torch.mm(A_fp32, W13_fp32.t())     # [Tk, G1]
 
         # SwiGLU: silu(up) * gate  ← gate=rows 0..I-1, up=rows I..G1-1
         C_gate = C_full[:, :_I]    # [Tk, I]
