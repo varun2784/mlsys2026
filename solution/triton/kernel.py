@@ -12,24 +12,21 @@ v11 (content fingerprint cache):  19/19 PASSED, same abs_err — fingerprint no 
 v12 (in-loop allow_tf32 toggle):  19/19 PASSED, abs_err WORSE (2048-4096)
     → In-loop toggle races cuBLAS async dispatch; fingerprint causes spurious misses
 
-v13: fix both problems cleanly.
-  - Set allow_tf32=False ONCE at module load (no per-loop toggle, no race)
-  - Remove content fingerprint (plain ptr key — no GPU→CPU sync overhead)
-  - W2 cache preserved (correct for repeated workload calls)
-  - cuBLAS selects fp32 SIMT path for both GEMMs (no TF32 rounding error)
-  - Target: v10b speedups with abs_err=0
+v13 (allow_tf32=False at load):   19/19 PASSED, 0.96-1.95x, abs_err still 64-1024
+    → TF32 not the root cause; cuBLAS fp32 accumulation order differs from ref
 
-Note: cuBLAS fp32 (no TF32) is still faster than Triton FFMA v7 because cuBLAS
-uses optimized memory layouts, prefetch, and better SM utilization vs our handwritten
-Triton kernel. Expected speedup: between v7 (0.93-0.99x) and v10b (1.0-1.94x).
+v14: drop W2 cache entirely — per-call view+broadcast dequant for both W13 and W2.
+  - No caching at all → no ABA possible, no fingerprint hacks needed
+  - W2 per-call dequant: [H,I] fp8 → view [56,128,16,128] × scale [56,1,16,1]
+  - allow_tf32=False retained (reduces some numerical drift vs ref)
+  - Cost: ~70MB extra HBM per active expert per call (W2 dequant)
+  - Target: abs_err=0 (matching v7 correctness) at >1.0x speedup
 """
 
 import torch
 import torch.nn.functional as F
 
-# Disable TF32 globally at module load — fixes accumulated rounding error in GEMM1.
-# FP8-dequanted values (fp8_val × fp32_scale) need >10-bit mantissa precision;
-# TF32 truncates to 10 bits, giving abs_err 512-4096 over 7168 K-iterations.
+# Disable TF32 at module load (reduces numerical drift vs reference).
 torch.backends.cuda.matmul.allow_tf32 = False
 
 _H     = 7168
@@ -42,20 +39,6 @@ _N_GRP = 8
 _TK_GRP= 4
 _BLKSZ = 128   # FP8 block-scale granularity
 
-# ─────────────────────────────────────────────────────────────────────────────
-# W2 fp32 cache — single-entry, composite key (data_ptr + scale_ptr)
-# ─────────────────────────────────────────────────────────────────────────────
-_cache_w2_key = None
-_cache_w2_val = None    # list of 32 × [H, I] fp32
-
-
-def _dequant_2d(fp8_t, scale_t):
-    """FP8 [R,C] + block-scales [R//128, C//128] → fp32 [R,C]."""
-    fp32 = fp8_t.to(torch.float32)
-    s    = (scale_t.to(torch.float32)
-                   .repeat_interleave(_BLKSZ, dim=0)
-                   .repeat_interleave(_BLKSZ, dim=1))
-    return fp32 * s
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -111,18 +94,6 @@ def kernel(
                                   .permute(1, 0)
                                   .contiguous())   # [T, 56]
 
-    # ── W2 fp32 cache ─────────────────────────────────────────────────────────
-    global _cache_w2_key, _cache_w2_val
-    w2_key = (gemm2_weights.data_ptr(), gemm2_weights_scale.data_ptr())
-    if w2_key != _cache_w2_key:
-        _cache_w2_val = None
-        _cache_w2_val = [
-            _dequant_2d(gemm2_weights[le], gemm2_weights_scale[le])
-            for le in range(_E_LOC)
-        ]
-        _cache_w2_key = w2_key
-    W2_all = _cache_w2_val     # list of [H, I] fp32
-
     out_f32     = torch.zeros(T, _H, dtype=torch.float32, device=device)
     local_start = int(local_expert_offset)
 
@@ -158,8 +129,14 @@ def kernel(
         C_up   = C_full[:, _I:]    # [Tk, I]
         C      = (C_up * torch.sigmoid(C_up)) * C_gate     # [Tk, I]
 
-        # ── GEMM2: cuBLAS fp32 (same global flag) ────────────────────────────
-        O = torch.mm(C, W2_all[le].t())   # [Tk, I] @ [I, H] → [Tk, H]
+        # ── Efficient W2 dequant: view+broadcast per call (no cache, no ABA) ──
+        S2_e    = gemm2_weights_scale[le]           # [56, 16] fp32
+        W2_fp32 = gemm2_weights[le].to(torch.float32)        # [H, I]
+        W2_fp32 = W2_fp32.view(_H // _BLKSZ, _BLKSZ, _I // _BLKSZ, _BLKSZ)
+        W2_fp32 = (W2_fp32 * S2_e.unsqueeze(1).unsqueeze(3)).view(_H, _I)
+
+        # ── GEMM2: cuBLAS fp32 ───────────────────────────────────────────────
+        O = torch.mm(C, W2_fp32.t())      # [Tk, I] @ [I, H] → [Tk, H]
 
         w_tok = weights_scaled[tok_idx, ge]
         out_f32.index_add_(0, tok_idx, O * w_tok.unsqueeze(1))
