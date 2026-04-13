@@ -16,18 +16,19 @@ v13 (allow_tf32=False at load):   19/19 PASSED, 0.96-1.95x, abs_err still 64-102
     → TF32 not the root cause; cuBLAS fp32 accumulation order differs from ref
 
 v14: drop W2 cache entirely — per-call view+broadcast dequant for both W13 and W2.
-  - No caching at all → no ABA possible, no fingerprint hacks needed
-  - W2 per-call dequant: [H,I] fp8 → view [56,128,16,128] × scale [56,1,16,1]
-  - allow_tf32=False retained (reduces some numerical drift vs ref)
-  - Cost: ~70MB extra HBM per active expert per call (W2 dequant)
-  - Target: abs_err=0 (matching v7 correctness) at >1.0x speedup
+  - No caching at all → no ABA possible
+  - Speedup: 1.0-4.33x — skipping empty experts makes per-call dequant cheap
+  - abs_err still nonzero on 3 workloads (cuBLAS vs ref accumulation order)
+  - allow_tf32=False (lost tensor core throughput for large T)
+
+v15: re-enable TF32 — abs_err not from TF32 (proved by v13/v14), gain tensor cores.
+  - allow_tf32=True (default) → TF32 tensor cores for large-T compute-bound GEMMs
+  - Keep no-cache per-call view+broadcast dequant (key to small-T speedup)
+  - Target: maintain 4.33x small-T + improve large-T from 1.0x toward 2x+
 """
 
 import torch
 import torch.nn.functional as F
-
-# Disable TF32 at module load (reduces numerical drift vs reference).
-torch.backends.cuda.matmul.allow_tf32 = False
 
 _H     = 7168
 _I     = 2048
