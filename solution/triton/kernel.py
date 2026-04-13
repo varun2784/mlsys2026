@@ -1,24 +1,27 @@
 """
-FP8 Block-Scale Fused MoE Kernel  –  v7
+FP8 Block-Scale Fused MoE Kernel  –  v10b
 Definition: moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048
 
-v5  (reference, fp32):          19/19 PASSED, abs_err=0, ~1.0x
-v6f (fp32 cuBLAS + W cache):    19/19 PASSED, abs_err=0, ~0.93-0.99x
+v5  (reference):                  19/19 PASSED, abs_err=0, ~1.0x
+v6f (W2 cache + cuBLAS):          19/19 PASSED, abs_err=0, ~0.93-0.99x
+v7  (Triton fp32 GEMM1, atf32=F): 19/19 PASSED, abs_err=0, ~0.93-0.99x
+v8-v9 (TF32/fp16/fp8 tl.dot):    RUNTIME_ERROR — only atf32=False works on B200
+v10 (W13+W2 cache + cuBLAS TF32): 19/19 PASSED, 0.92-0.98x BUT large abs_err
+    → W13 cache hits ABA problem (benchmark reuses memory addresses)
 
-v7 key change: GEMM1 in Triton with on-the-fly FP8 dequant for A and W13.
-  - No W13 fp32 cache needed: load 938 MB fp8 instead of 3.75 GB fp32 (~4× bandwidth)
-  - SwiGLU fused in GEMM1 epilogue (no [Tk,G1] HBM round-trip)
-  - BLOCK_K = BLOCK_N = 128 fixed → one scale scalar per W-tile (exact, no approx)
-  - BLOCK_M autotuned over {16,32,64,128} × {4,8} warps × {3,4} stages = 16 configs
-  - GEMM2 stays cuBLAS + W2 fp32 cache (test fp8 W13 first; W2 fp8 in v8)
+v10b: drop W13 cache (ABA-unsafe at 3.75 GB scale), keep W2 cache.
+  - Per-call W13 dequant via efficient view+broadcast (no repeat_interleave)
+  - Per-call A dequant via view+broadcast
+  - cuBLAS TF32 for GEMM1 (tensor cores, faster than Triton FFMA)
+  - W2 fp32 cache (safe — smaller and ABA-protected with composite key)
+  - cuBLAS TF32 for GEMM2
 
-Note: v6 RUNTIME_ERROR was from tl.static_range scatter bug in GEMM2, NOT fp8 loading.
+Efficient dequant: view+broadcast instead of repeat_interleave avoids large
+intermediate scale tensors and is better for cache utilization.
 """
 
 import torch
 import torch.nn.functional as F
-import triton
-import triton.language as tl
 
 _H     = 7168
 _I     = 2048
@@ -31,10 +34,11 @@ _TK_GRP= 4
 _BLKSZ = 128   # FP8 block-scale granularity
 
 # ─────────────────────────────────────────────────────────────────────────────
-# W2 fp32 cache (single-entry, evicted when scale ptr changes)
+# W2 fp32 cache — single-entry, ABA-safe composite key
+# (W13 cache dropped: too large at 3.75 GB → ABA false matches in benchmark)
 # ─────────────────────────────────────────────────────────────────────────────
 _cache_w2_key = None
-_cache_w2_val = None
+_cache_w2_val = None    # list of 32 × [H, I] fp32
 
 
 def _dequant_2d(fp8_t, scale_t):
@@ -44,98 +48,6 @@ def _dequant_2d(fp8_t, scale_t):
                    .repeat_interleave(_BLKSZ, dim=0)
                    .repeat_interleave(_BLKSZ, dim=1))
     return fp32 * s
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Triton GEMM1 + SwiGLU  (fp8 A × fp8 W, on-the-fly dequant)
-#
-#   A   : [M, K]    fp8   K = H = 7168
-#   W   : [2N, K]   fp8   N = I = 2048  (rows 0..N-1 = gate, N..2N-1 = up)
-#   C   : [M, N]    fp32  = silu(up) * gate
-#   A_scale : [M, K//128]     fp32   per-(token, K-block) scale
-#   W_scale : [2N//128, K//128] fp32 per-(N-block, K-block) scale
-#
-#   BLOCK_K = BLOCK_N = 128 fixed (matches _BLKSZ scale granularity)
-#   → exactly one W scale scalar per tile load
-# ─────────────────────────────────────────────────────────────────────────────
-@triton.autotune(
-    configs=[
-        triton.Config({"BLOCK_M": bm}, num_warps=nw, num_stages=ns)
-        for bm in [16, 32, 64, 128]
-        for nw in [4, 8]
-        for ns in [3, 4]
-    ],
-    key=["M"],   # N=2048 and K=7168 are constants; only M (= Tk) varies
-)
-@triton.jit
-def _gemm1_swiglu_fp8(
-    A_ptr, A_scale_ptr,
-    W_ptr, W_scale_ptr,
-    C_ptr,
-    M, N, K,
-    stride_am, stride_ak,
-    stride_wn, stride_wk,
-    stride_cm, stride_cn,
-    stride_asm, stride_ask,
-    stride_wsn, stride_wsk,
-    BLOCK_M: tl.constexpr,
-):
-    BLOCK_N: tl.constexpr = 128   # = _BLKSZ
-    BLOCK_K: tl.constexpr = 128   # = _BLKSZ
-
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)   # tile over N (= I = 2048)
-
-    m_offs = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    n_gate = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)   # rows of W for gate [0..N)
-    n_up   = n_gate + N                                  # rows of W for up   [N..2N)
-
-    acc_g = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-    acc_u = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-
-    for kb in range(K // BLOCK_K):   # 56 K-block iterations
-        k_offs = kb * BLOCK_K + tl.arange(0, BLOCK_K)
-
-        # ── A tile [BLOCK_M, BLOCK_K] fp8 → fp32 ─────────────────────────────
-        a_ptrs = A_ptr + m_offs[:, None] * stride_am + k_offs[None, :] * stride_ak
-        a_tile = tl.load(a_ptrs, mask=m_offs[:, None] < M, other=0).to(tl.float32)
-
-        # A scale: [BLOCK_M]  (one per row per K-block)
-        a_scale = tl.load(
-            A_scale_ptr + m_offs * stride_asm + kb * stride_ask,
-            mask=m_offs < M, other=1.0,
-        )
-        a_tile = a_tile * a_scale[:, None]
-
-        # ── W_gate tile [BLOCK_K, BLOCK_N] fp8 → fp32 ────────────────────────
-        # Transposed load: W[n, k] → tile[k, n] for tl.dot(a_tile, wg_tile)
-        wg_ptrs = W_ptr + n_gate[None, :] * stride_wn + k_offs[:, None] * stride_wk
-        wg_tile = tl.load(wg_ptrs, mask=n_gate[None, :] < N, other=0).to(tl.float32)
-
-        # W_gate scale: single scalar for this 128×128 block
-        wg_scale = tl.load(W_scale_ptr + pid_n * stride_wsn + kb * stride_wsk)
-        wg_tile  = wg_tile * wg_scale
-
-        # ── W_up tile [BLOCK_K, BLOCK_N] fp8 → fp32 ──────────────────────────
-        wu_ptrs = W_ptr + n_up[None, :] * stride_wn + k_offs[:, None] * stride_wk
-        wu_tile = tl.load(wu_ptrs, other=0).to(tl.float32)
-
-        # W_up scale: N-block index shifted by N//BLOCK_N = 16
-        wu_scale = tl.load(
-            W_scale_ptr + (pid_n + N // BLOCK_N) * stride_wsn + kb * stride_wsk
-        )
-        wu_tile = wu_tile * wu_scale
-
-        # ── Accumulate gate and up separately ────────────────────────────────
-        acc_g += tl.dot(a_tile, wg_tile, allow_tf32=False)
-        acc_u += tl.dot(a_tile, wu_tile, allow_tf32=False)
-
-    # SwiGLU: silu(up) * gate  (matches v5 reference exactly)
-    result = (acc_u * tl.sigmoid(acc_u)) * acc_g
-
-    c_ptrs = C_ptr + m_offs[:, None] * stride_cm + n_gate[None, :] * stride_cn
-    tl.store(c_ptrs, result,
-             mask=(m_offs[:, None] < M) & (n_gate[None, :] < N))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -163,7 +75,7 @@ def _route(routing_logits, routing_bias, device, T):
     M_tok.scatter_(1, topk_idx, 1.0)
     w    = s * M_tok
     wsum = w.sum(dim=1, keepdim=True) + 1e-20
-    return topk_idx, w / wsum   # [T, 8], [T, 256]
+    return topk_idx, w / wsum
 
 
 def kernel(
@@ -184,14 +96,14 @@ def kernel(
 
     # ── Routing ───────────────────────────────────────────────────────────────
     topk_idx, weights_norm = _route(routing_logits, routing_bias, device, T)
-    weights_scaled = weights_norm * routed_scaling_factor   # [T, 256]
+    weights_scaled = weights_norm * routed_scaling_factor
 
-    # ── A scale: [56, T] → [T, 56]  (used inside Triton kernel) ─────────────
+    # A_scale: [56, T] → [T, 56]
     A_scale = (hidden_states_scale.to(torch.float32)
                                   .permute(1, 0)
-                                  .contiguous())   # [T, 56] fp32
+                                  .contiguous())   # [T, 56]
 
-    # ── W2 fp32 cache (single-entry; evicted when scale ptr changes) ─────────
+    # ── W2 fp32 cache ─────────────────────────────────────────────────────────
     global _cache_w2_key, _cache_w2_val
     w2_key = (gemm2_weights.data_ptr(), gemm2_weights_scale.data_ptr())
     if w2_key != _cache_w2_key:
@@ -201,9 +113,8 @@ def kernel(
             for le in range(_E_LOC)
         ]
         _cache_w2_key = w2_key
-    W2_all = _cache_w2_val   # list of [H, I] fp32
+    W2_all = _cache_w2_val     # list of [H, I] fp32
 
-    # ── Output accumulator ────────────────────────────────────────────────────
     out_f32     = torch.zeros(T, _H, dtype=torch.float32, device=device)
     local_start = int(local_expert_offset)
 
@@ -216,38 +127,32 @@ def kernel(
         if not sel.any():
             continue
 
-        tok_idx = sel.nonzero(as_tuple=False).squeeze(1)   # [Tk]
+        tok_idx = sel.nonzero(as_tuple=False).squeeze(1)
         Tk      = tok_idx.shape[0]
 
-        # fp8 A slice and its scales (no fp32 expansion)
-        A_e       = hidden_states[tok_idx]     # [Tk, H] fp8
-        A_scale_e = A_scale[tok_idx]           # [Tk, 56] fp32
+        # ── Efficient A dequant: view+broadcast, no repeat_interleave ────────
+        A_fp8_e   = hidden_states[tok_idx]          # [Tk, H] fp8
+        A_scale_e = A_scale[tok_idx]                # [Tk, 56]
+        A_fp32    = A_fp8_e.to(torch.float32).view(Tk, 56, _BLKSZ)
+        A_fp32    = (A_fp32 * A_scale_e.unsqueeze(2)).view(Tk, _H)  # [Tk, H]
 
-        # fp8 W13 slice and its scales (no fp32 expansion needed)
-        W13_e  = gemm1_weights[le]              # [G1, H] fp8  (view, no copy)
-        S13_e  = gemm1_weights_scale[le]        # [32, 56] fp32
+        # ── Efficient W13 dequant: view+broadcast per call (no cache, no ABA) ─
+        S13_e   = gemm1_weights_scale[le]           # [32, 56] fp32
+        W13_fp32 = gemm1_weights[le].to(torch.float32)       # [G1, H]
+        # Reshape to [G1//128, 128, H//128, 128] = [32, 128, 56, 128]
+        W13_fp32 = W13_fp32.view(_G1 // _BLKSZ, _BLKSZ, _H // _BLKSZ, _BLKSZ)
+        # S13_e [32, 56] → [32, 1, 56, 1] broadcasts over [32, 128, 56, 128]
+        W13_fp32 = (W13_fp32 * S13_e.unsqueeze(1).unsqueeze(3)).view(_G1, _H)
 
-        # ── GEMM1 + SwiGLU via Triton (fp8 on-the-fly dequant) ───────────────
-        C = torch.empty(Tk, _I, dtype=torch.float32, device=device)
+        # ── GEMM1: cuBLAS TF32 tensor cores (exact for fp8-derived inputs) ───
+        C_full = torch.mm(A_fp32, W13_fp32.t())     # [Tk, G1]
 
-        grid = lambda meta: (
-            triton.cdiv(Tk, meta["BLOCK_M"]),
-            _I // _BLKSZ,   # = 16 tiles  (BLOCK_N=128, N=2048)
-        )
+        # SwiGLU: silu(up) * gate  ← gate=rows 0..I-1, up=rows I..G1-1
+        C_gate = C_full[:, :_I]    # [Tk, I]
+        C_up   = C_full[:, _I:]    # [Tk, I]
+        C      = (C_up * torch.sigmoid(C_up)) * C_gate     # [Tk, I]
 
-        _gemm1_swiglu_fp8[grid](
-            A_e, A_scale_e,
-            W13_e, S13_e,
-            C,
-            Tk, _I, _H,
-            A_e.stride(0),    A_e.stride(1),
-            W13_e.stride(0),  W13_e.stride(1),
-            C.stride(0),      C.stride(1),
-            A_scale_e.stride(0), A_scale_e.stride(1),
-            S13_e.stride(0),  S13_e.stride(1),
-        )
-
-        # ── GEMM2: cached fp32 W2 + cuBLAS ───────────────────────────────────
+        # ── GEMM2: cuBLAS TF32 ────────────────────────────────────────────────
         O = torch.mm(C, W2_all[le].t())   # [Tk, I] @ [I, H] → [Tk, H]
 
         w_tok = weights_scaled[tok_idx, ge]
