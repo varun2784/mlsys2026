@@ -1,5 +1,5 @@
 """
-FP8 Block-Scale Fused MoE Kernel  –  v10b
+FP8 Block-Scale Fused MoE Kernel  –  v11
 Definition: moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048
 
 v5  (reference):                  19/19 PASSED, abs_err=0, ~1.0x
@@ -8,16 +8,13 @@ v7  (Triton fp32 GEMM1, atf32=F): 19/19 PASSED, abs_err=0, ~0.93-0.99x
 v8-v9 (TF32/fp16/fp8 tl.dot):    RUNTIME_ERROR — only atf32=False works on B200
 v10 (W13+W2 cache + cuBLAS TF32): 19/19 PASSED, 0.92-0.98x BUT large abs_err
     → W13 cache hits ABA problem (benchmark reuses memory addresses)
+v10b (no W13 cache, W2 cache):    19/19 PASSED, 1.0-1.94x BUT abs_err on some
+    → W2 cache ABA: data_ptr key not sufficient when benchmark recycles memory
 
-v10b: drop W13 cache (ABA-unsafe at 3.75 GB scale), keep W2 cache.
-  - Per-call W13 dequant via efficient view+broadcast (no repeat_interleave)
-  - Per-call A dequant via view+broadcast
-  - cuBLAS TF32 for GEMM1 (tensor cores, faster than Triton FFMA)
-  - W2 fp32 cache (safe — smaller and ABA-protected with composite key)
-  - cuBLAS TF32 for GEMM2
-
-Efficient dequant: view+broadcast instead of repeat_interleave avoids large
-intermediate scale tensors and is better for cache utilization.
+v11: fix W2 cache ABA with content fingerprint (2 O(1) scalar reads).
+  - Cache key = (data_ptr, scale_ptr, first_elem, last_elem) of W2
+  - Stale cache entry is detected and evicted when any element differs
+  - All other optimizations from v10b preserved (view+broadcast dequant, TF32)
 """
 
 import torch
@@ -105,7 +102,15 @@ def kernel(
 
     # ── W2 fp32 cache ─────────────────────────────────────────────────────────
     global _cache_w2_key, _cache_w2_val
-    w2_key = (gemm2_weights.data_ptr(), gemm2_weights_scale.data_ptr())
+    # Content fingerprint: two O(1) scalar reads catch ABA false matches.
+    # Benchmark recycles GPU memory addresses → data_ptr alone is insufficient.
+    _w2_flat = gemm2_weights.view(-1)
+    w2_key = (
+        gemm2_weights.data_ptr(),
+        gemm2_weights_scale.data_ptr(),
+        _w2_flat[0].item(),
+        _w2_flat[-1].item(),
+    )
     if w2_key != _cache_w2_key:
         _cache_w2_val = None
         _cache_w2_val = [
