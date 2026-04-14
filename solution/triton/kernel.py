@@ -1,12 +1,13 @@
 """
-FP8 Block-Scale Fused MoE Kernel  –  v18b
+FP8 Block-Scale Fused MoE Kernel  –  v18c
 Definition: moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048
 
 v17: torch.compile W13/W2 dequant → 2.5ms HBM savings, 4.52x peak, 1.10x worst
-v18: additional fusions — routing kept eager (compile caused -0.44x regression):
-  - Fuse A gather + dequant: hidden_states[tok_idx] + fp8→fp32 + scale mul → 1 kernel
-  - Fuse SwiGLU: sigmoid + 2 multiplies → 1 kernel (saves 2 HBM read-write cycles)
-  - Routing: remains eager (scatter_ ops cause graph breaks, hurt small-T perf)
+v18b: gather+dequant_A + SwiGLU fusion → helped large-T but hurt small-T (e05c6c03 -0.35x)
+v18c: only fuse SwiGLU (3 kernels → 1) — skips gather+dequant which hurt tiny Tk:
+  - _dequant_A stays eager-gathered then compiled (like v17)
+  - _swiglu: sigmoid + 2 multiplies → 1 kernel, saves ~1.4ms on large-T workloads
+  - Routing: eager (scatter_ causes graph breaks)
 """
 
 import torch
@@ -23,17 +24,12 @@ _BLKSZ = 128   # FP8 block-scale granularity
 
 # ─── Compiled fused kernels ───────────────────────────────────────────────────
 
-@torch.compile(fullgraph=True, dynamic=True)
-def _gather_dequant_A(
-    hidden_states: torch.Tensor,   # [T, H] fp8
-    A_scale: torch.Tensor,         # [T, 56] fp32
-    tok_idx: torch.Tensor,         # [Tk] int
-) -> torch.Tensor:
-    """Gather + dequant in one pass: avoids writing [Tk, H] fp8 gather to HBM."""
-    A_fp8 = hidden_states[tok_idx]                       # gather [Tk, H] fp8
+@torch.compile(fullgraph=True)
+def _dequant_A(A_fp8: torch.Tensor, A_scale: torch.Tensor) -> torch.Tensor:
+    """[Tk, H] fp8 + [Tk, 56] scale → [Tk, H] fp32."""
     Tk = A_fp8.shape[0]
     return (A_fp8.to(torch.float32).view(Tk, 56, _BLKSZ)
-            * A_scale[tok_idx].unsqueeze(2)).view(Tk, _H)
+            * A_scale.unsqueeze(2)).view(Tk, _H)
 
 
 @torch.compile(fullgraph=True)
@@ -54,7 +50,7 @@ def _dequant_W2(W2_fp8: torch.Tensor, S2: torch.Tensor) -> torch.Tensor:
 
 @torch.compile(fullgraph=True, dynamic=True)
 def _swiglu(C_full: torch.Tensor) -> torch.Tensor:
-    """SwiGLU: fuse sigmoid + 2 multiplies into 1 kernel. Saves 2 HBM passes."""
+    """SwiGLU: fuse sigmoid + 2 multiplies into 1 kernel. Saves ~1.4ms for large-T."""
     C_gate = C_full[:, :_I]
     C_up   = C_full[:, _I:]
     return (C_up * torch.sigmoid(C_up)) * C_gate
@@ -127,8 +123,8 @@ def kernel(
 
         tok_idx = sel.nonzero(as_tuple=False).squeeze(1)
 
-        # ── Fused gather + A dequant (1 kernel: fp8 gather+cast+scale) ───────
-        A_fp32 = _gather_dequant_A(hidden_states, A_scale, tok_idx)  # [Tk, H]
+        # ── Fused A dequant (1 kernel: fp8→fp32 + scale mul) ─────────────────
+        A_fp32 = _dequant_A(hidden_states[tok_idx], A_scale[tok_idx])  # [Tk, H]
 
         # ── Fused W13 dequant (1 kernel, fixed shape) ─────────────────────────
         W13_fp32 = _dequant_W13(gemm1_weights[le], gemm1_weights_scale[le])   # [G1, H]
