@@ -1,13 +1,13 @@
 """
-FP8 Block-Scale Fused MoE Kernel  –  v18c
+FP8 Block-Scale Fused MoE Kernel  –  v19
 Definition: moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048
 
-v17: torch.compile W13/W2 dequant → 2.5ms HBM savings, 4.52x peak, 1.10x worst
-v18b: gather+dequant_A + SwiGLU fusion → helped large-T but hurt small-T (e05c6c03 -0.35x)
-v18c: only fuse SwiGLU (3 kernels → 1) — skips gather+dequant which hurt tiny Tk:
-  - _dequant_A stays eager-gathered then compiled (like v17)
-  - _swiglu: sigmoid + 2 multiplies → 1 kernel, saves ~1.4ms on large-T workloads
-  - Routing: eager (scatter_ causes graph breaks)
+v17: torch.compile dequant W13/W2 → 2.5ms savings, 4.52x peak
+v18c: + compiled SwiGLU → 7.16x peak, geomean ~2.54x (BREAKTHROUGH)
+v19: compile entire per-expert computation as one function:
+     dequant_A + dequant_W13 + GEMM1 + SwiGLU + dequant_W2 + GEMM2
+     → inductor can optimize full computation graph, possibly eliminate
+       intermediate materializations and schedule memory more efficiently.
 """
 
 import torch
@@ -22,42 +22,46 @@ _N_GRP = 8
 _TK_GRP= 4
 _BLKSZ = 128   # FP8 block-scale granularity
 
-# ─── Compiled fused kernels ───────────────────────────────────────────────────
-
-@torch.compile(fullgraph=True)
-def _dequant_A(A_fp8: torch.Tensor, A_scale: torch.Tensor) -> torch.Tensor:
-    """[Tk, H] fp8 + [Tk, 56] scale → [Tk, H] fp32."""
-    Tk = A_fp8.shape[0]
-    return (A_fp8.to(torch.float32).view(Tk, 56, _BLKSZ)
-            * A_scale.unsqueeze(2)).view(Tk, _H)
-
-
-@torch.compile(fullgraph=True)
-def _dequant_W13(W13_fp8: torch.Tensor, S13: torch.Tensor) -> torch.Tensor:
-    """[G1, H] fp8 + [32, 56] scale → [G1, H] fp32. Fixed shape — compiled once."""
-    return (W13_fp8.to(torch.float32)
-            .view(_G1 // _BLKSZ, _BLKSZ, _H // _BLKSZ, _BLKSZ)
-            * S13.unsqueeze(1).unsqueeze(3)).view(_G1, _H)
-
-
-@torch.compile(fullgraph=True)
-def _dequant_W2(W2_fp8: torch.Tensor, S2: torch.Tensor) -> torch.Tensor:
-    """[H, I] fp8 + [56, 16] scale → [H, I] fp32. Fixed shape — compiled once."""
-    return (W2_fp8.to(torch.float32)
-            .view(_H // _BLKSZ, _BLKSZ, _I // _BLKSZ, _BLKSZ)
-            * S2.unsqueeze(1).unsqueeze(3)).view(_H, _I)
-
 
 @torch.compile(fullgraph=True, dynamic=True)
-def _swiglu(C_full: torch.Tensor) -> torch.Tensor:
-    """SwiGLU: fuse sigmoid + 2 multiplies into 1 kernel. Saves ~1.4ms for large-T."""
-    C_gate = C_full[:, :_I]
-    C_up   = C_full[:, _I:]
-    return (C_up * torch.sigmoid(C_up)) * C_gate
+def _expert_fwd(
+    A_fp8:   torch.Tensor,   # [Tk, H] fp8
+    A_sc:    torch.Tensor,   # [Tk, 56] fp32
+    W13_fp8: torch.Tensor,   # [G1, H] fp8
+    S13:     torch.Tensor,   # [32, 56] fp32
+    W2_fp8:  torch.Tensor,   # [H, I] fp8
+    S2:      torch.Tensor,   # [56, 16] fp32
+) -> torch.Tensor:
+    """Full per-expert forward: dequant + GEMM1 + SwiGLU + dequant + GEMM2."""
+    Tk = A_fp8.shape[0]
+
+    # A dequant
+    A = (A_fp8.to(torch.float32).view(Tk, 56, _BLKSZ) * A_sc.unsqueeze(2)).view(Tk, _H)
+
+    # W13 dequant
+    W13 = (W13_fp8.to(torch.float32)
+           .view(_G1 // _BLKSZ, _BLKSZ, _H // _BLKSZ, _BLKSZ)
+           * S13.unsqueeze(1).unsqueeze(3)).view(_G1, _H)
+
+    # GEMM1: cuBLAS via torch.mm
+    Cf = torch.mm(A, W13.t())   # [Tk, G1]
+
+    # SwiGLU (non-contiguous slices: inductor handles strided loads natively)
+    Cg = Cf[:, :_I]
+    Cu = Cf[:, _I:]
+    C  = (Cu * torch.sigmoid(Cu)) * Cg  # [Tk, I]
+
+    # W2 dequant
+    W2 = (W2_fp8.to(torch.float32)
+          .view(_H // _BLKSZ, _BLKSZ, _I // _BLKSZ, _BLKSZ)
+          * S2.unsqueeze(1).unsqueeze(3)).view(_H, _I)
+
+    # GEMM2: cuBLAS via torch.mm
+    return torch.mm(C, W2.t())   # [Tk, H]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Routing – kept eager: scatter_ causes graph breaks, compile hurts small-T
+# Routing – eager (scatter_ ops cause graph breaks in torch.compile)
 # ─────────────────────────────────────────────────────────────────────────────
 def _route(routing_logits, routing_bias, device, T):
     s   = torch.sigmoid(routing_logits.to(torch.float32))
@@ -100,11 +104,11 @@ def kernel(
     T      = routing_logits.shape[0]
     device = hidden_states.device
 
-    # ── Routing (compiled: fuse elementwise ops around reductions) ────────────
+    # ── Routing ───────────────────────────────────────────────────────────────
     topk_idx, weights_norm = _route(routing_logits, routing_bias, device, T)
     weights_scaled = weights_norm * routed_scaling_factor
 
-    # A_scale: [56, T] → [T, 56] (contiguous for gather in _gather_dequant_A)
+    # A_scale: [56, T] → [T, 56]
     A_scale = (hidden_states_scale.to(torch.float32)
                                   .permute(1, 0)
                                   .contiguous())   # [T, 56]
@@ -123,25 +127,13 @@ def kernel(
 
         tok_idx = sel.nonzero(as_tuple=False).squeeze(1)
 
-        # ── Fused A dequant (1 kernel: fp8→fp32 + scale mul) ─────────────────
-        A_fp32 = _dequant_A(hidden_states[tok_idx], A_scale[tok_idx])  # [Tk, H]
+        # ── Compiled full expert forward (dequant + GEMM1 + SwiGLU + dequant + GEMM2) ──
+        O = _expert_fwd(
+            hidden_states[tok_idx], A_scale[tok_idx],
+            gemm1_weights[le], gemm1_weights_scale[le],
+            gemm2_weights[le], gemm2_weights_scale[le],
+        )   # [Tk, H]
 
-        # ── Fused W13 dequant (1 kernel, fixed shape) ─────────────────────────
-        W13_fp32 = _dequant_W13(gemm1_weights[le], gemm1_weights_scale[le])   # [G1, H]
-
-        # ── GEMM1: cuBLAS TF32 tensor cores ──────────────────────────────────
-        C_full = torch.mm(A_fp32, W13_fp32.t())     # [Tk, G1]
-
-        # ── Fused SwiGLU (1 kernel: sigmoid + 2 muls, saves 2 HBM passes) ────
-        C = _swiglu(C_full)   # [Tk, I]
-
-        # ── Fused W2 dequant (1 kernel, fixed shape) ─────────────────────────
-        W2_fp32 = _dequant_W2(gemm2_weights[le], gemm2_weights_scale[le])     # [H, I]
-
-        # ── GEMM2: cuBLAS TF32 tensor cores ──────────────────────────────────
-        O = torch.mm(C, W2_fp32.t())      # [Tk, I] @ [I, H] → [Tk, H]
-
-        # ── Weighted output accumulation ──────────────────────────────────────
         w_tok = weights_scaled[tok_idx, ge]
         out_f32.index_add_(0, tok_idx, O * w_tok.unsqueeze(1))
 
