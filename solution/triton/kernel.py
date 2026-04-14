@@ -1,14 +1,22 @@
 """
-FP8 Block-Scale Fused MoE Kernel  –  v20
+FP8 Block-Scale Fused MoE Kernel  –  v21 (= v18c restored)
 Definition: moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048
 
-v18c: compiled SwiGLU → 7.16x peak, geomean ~2.54x (BEST so far)
-v19:  compiled full expert fwd → WORSE (inductor's GEMM ≪ cuBLAS)
-v20:  back to v18c structure + add:
-  - Compiled weighted accumulation: fuse O * w_tok.unsqueeze(1) + index_add_
-    into one Triton kernel, saves ~90MB HBM per active expert
-  - mode='reduce-overhead' on the frequently-called inner kernels to
-    enable CUDA graph capture and reduce kernel launch overhead
+Version history:
+v14 (no cache, no TF32):     19/19 PASSED, 1.0-4.33x peak
+v17 (torch.compile dequant): 19/19 PASSED, 1.10-4.52x, geomean ~1.66x
+v18c (+ compiled SwiGLU):    19/19 PASSED, 1.20-7.16x, geomean ~2.54x  ← BEST
+v19 (full expert compiled):  19/19 PASSED, WORSE — inductor GEMM < cuBLAS
+v20 (+ compiled accum):      19/19 PASSED, WORSE — dynamic=True hurts small-T
+v21: restore v18c (confirmed best configuration)
+
+Key techniques:
+1. Expert skipping: if not sel.any(): continue (critical for small-T speedup)
+2. view+broadcast dequant: no cache, no ABA, per-call for W13/W2
+3. torch.compile fused dequant: fuses fp8→fp32 + scale mul into 1 Triton kernel
+4. torch.compile SwiGLU with dynamic=True: fuses sigmoid + 2 muls, handles
+   non-contiguous C_full slices via strided Triton loads (saves ~1.4ms large-T)
+5. cuBLAS TF32 for GEMM1 + GEMM2 (tensor cores, not WGMMA which crashes on B200)
 """
 
 import torch
@@ -23,10 +31,11 @@ _N_GRP = 8
 _TK_GRP= 4
 _BLKSZ = 128   # FP8 block-scale granularity
 
-# ─── Compiled fused kernels (called 32x per workload, inner loop) ─────────────
+# ─── Compiled fused kernels ───────────────────────────────────────────────────
 
-@torch.compile(fullgraph=True, dynamic=True)
+@torch.compile(fullgraph=True)
 def _dequant_A(A_fp8: torch.Tensor, A_scale: torch.Tensor) -> torch.Tensor:
+    """[Tk, H] fp8 + [Tk, 56] scale → [Tk, H] fp32. One HBM pass."""
     Tk = A_fp8.shape[0]
     return (A_fp8.to(torch.float32).view(Tk, 56, _BLKSZ)
             * A_scale.unsqueeze(2)).view(Tk, _H)
@@ -34,6 +43,7 @@ def _dequant_A(A_fp8: torch.Tensor, A_scale: torch.Tensor) -> torch.Tensor:
 
 @torch.compile(fullgraph=True)
 def _dequant_W13(W13_fp8: torch.Tensor, S13: torch.Tensor) -> torch.Tensor:
+    """[G1, H] fp8 + [32, 56] scale → [G1, H] fp32. Fixed shape, compiled once."""
     return (W13_fp8.to(torch.float32)
             .view(_G1 // _BLKSZ, _BLKSZ, _H // _BLKSZ, _BLKSZ)
             * S13.unsqueeze(1).unsqueeze(3)).view(_G1, _H)
@@ -41,6 +51,7 @@ def _dequant_W13(W13_fp8: torch.Tensor, S13: torch.Tensor) -> torch.Tensor:
 
 @torch.compile(fullgraph=True)
 def _dequant_W2(W2_fp8: torch.Tensor, S2: torch.Tensor) -> torch.Tensor:
+    """[H, I] fp8 + [56, 16] scale → [H, I] fp32. Fixed shape, compiled once."""
     return (W2_fp8.to(torch.float32)
             .view(_H // _BLKSZ, _BLKSZ, _I // _BLKSZ, _BLKSZ)
             * S2.unsqueeze(1).unsqueeze(3)).view(_H, _I)
@@ -48,21 +59,15 @@ def _dequant_W2(W2_fp8: torch.Tensor, S2: torch.Tensor) -> torch.Tensor:
 
 @torch.compile(fullgraph=True, dynamic=True)
 def _swiglu(C_full: torch.Tensor) -> torch.Tensor:
-    """Fuse sigmoid + 2 multiplies into 1 kernel. Non-contiguous slices handled natively."""
+    """Fuse sigmoid + 2 muls into 1 kernel. Non-contiguous slices → strided Triton loads.
+    Saves ~1.4ms on large-T by eliminating 2 extra HBM passes over C_up."""
     C_gate = C_full[:, :_I]
     C_up   = C_full[:, _I:]
     return (C_up * torch.sigmoid(C_up)) * C_gate
 
 
-@torch.compile(dynamic=True)
-def _weighted_add(out_f32: torch.Tensor, tok_idx: torch.Tensor,
-                  O: torch.Tensor, w_tok: torch.Tensor) -> None:
-    """Fuse weight multiply with index_add_: saves one [Tk, H] HBM pass."""
-    out_f32.index_add_(0, tok_idx, O * w_tok.unsqueeze(1))
-
-
 # ─────────────────────────────────────────────────────────────────────────────
-# Routing – eager (scatter_ ops cause graph breaks in torch.compile)
+# Routing – eager (scatter_ causes graph breaks; compile hurts small-T)
 # ─────────────────────────────────────────────────────────────────────────────
 def _route(routing_logits, routing_bias, device, T):
     s   = torch.sigmoid(routing_logits.to(torch.float32))
@@ -136,6 +141,6 @@ def kernel(
         O        = torch.mm(C, W2_fp32.t())            # GEMM2: cuBLAS TF32
 
         w_tok = weights_scaled[tok_idx, ge]
-        _weighted_add(out_f32, tok_idx, O, w_tok)
+        out_f32.index_add_(0, tok_idx, O * w_tok.unsqueeze(1))
 
     output.copy_(out_f32.to(torch.bfloat16))
