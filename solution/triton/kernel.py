@@ -1,19 +1,20 @@
 """
-FP8 Block-Scale Fused MoE Kernel  –  v23
+FP8 Block-Scale Fused MoE Kernel  –  v24
 Definition: moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048
 
-v22: geomean ~1.69x
-v23: dequant all tensors to bf16 instead of fp32 for GEMMs
-  - cuBLAS bf16 GEMM: ~2x throughput vs TF32 on B200 (1979 vs 912 TFLOPS)
-  - Halves intermediate weight HBM traffic: W13 116MB→58MB, W2 58MB→29MB per expert
-  - atol=1, rtol=0.3 tolerances are loose enough for bf16 precision
+v22: geomean ~1.69x (v21/v18c = baseline)
+v24: add dynamic=True to _dequant_A to avoid per-Tk recompilation
+  - Without dynamic, each unique Tk triggers a new specialization;
+    19 workloads × ~8 unique Tk/workload = up to 152 recompiles.
+  - With dynamic=True: single symbolic compilation, amortized across all calls.
+  - Also ensures fullgraph=True still catches any remaining graph breaks.
 
 Key techniques (all from v17/v18c):
 1. Expert skipping: if not sel.any(): continue
 2. view+broadcast per-call dequant (no cache → no ABA)
-3. torch.compile dequant: fp8→fp32 (scale mul) →bf16
+3. torch.compile dequant: fp8→fp32 + scale mul fused
 4. torch.compile SwiGLU with dynamic=True: strided loads handle non-contiguous
-5. cuBLAS bf16 GEMMs (faster than TF32; Triton WGMMA crashes on B200 Modal)
+5. cuBLAS TF32 GEMMs (tensor cores; Triton WGMMA crashes on B200 Modal)
 """
 
 import torch
@@ -32,26 +33,26 @@ _BLKSZ = 128   # FP8 block-scale granularity
 
 @torch.compile(fullgraph=True, dynamic=True)
 def _dequant_A(A_fp8: torch.Tensor, A_scale: torch.Tensor) -> torch.Tensor:
-    """[Tk, H] fp8 + [Tk, 56] scale → [Tk, H] bf16. Scale in fp32, store bf16."""
+    """[Tk, H] fp8 + [Tk, 56] scale → [Tk, H] fp32. dynamic=True: compile once for all Tk."""
     Tk = A_fp8.shape[0]
     return (A_fp8.to(torch.float32).view(Tk, 56, _BLKSZ)
-            * A_scale.unsqueeze(2)).view(Tk, _H).to(torch.bfloat16)
+            * A_scale.unsqueeze(2)).view(Tk, _H)
 
 
 @torch.compile(fullgraph=True)
 def _dequant_W13(W13_fp8: torch.Tensor, S13: torch.Tensor) -> torch.Tensor:
-    """[G1, H] fp8 + [32, 56] scale → [G1, H] bf16. Scale in fp32, store bf16."""
+    """[G1, H] fp8 + [32, 56] scale → [G1, H] fp32. Fixed shape, compiled once."""
     return (W13_fp8.to(torch.float32)
             .view(_G1 // _BLKSZ, _BLKSZ, _H // _BLKSZ, _BLKSZ)
-            * S13.unsqueeze(1).unsqueeze(3)).view(_G1, _H).to(torch.bfloat16)
+            * S13.unsqueeze(1).unsqueeze(3)).view(_G1, _H)
 
 
 @torch.compile(fullgraph=True)
 def _dequant_W2(W2_fp8: torch.Tensor, S2: torch.Tensor) -> torch.Tensor:
-    """[H, I] fp8 + [56, 16] scale → [H, I] bf16. Scale in fp32, store bf16."""
+    """[H, I] fp8 + [56, 16] scale → [H, I] fp32. Fixed shape, compiled once."""
     return (W2_fp8.to(torch.float32)
             .view(_H // _BLKSZ, _BLKSZ, _I // _BLKSZ, _BLKSZ)
-            * S2.unsqueeze(1).unsqueeze(3)).view(_H, _I).to(torch.bfloat16)
+            * S2.unsqueeze(1).unsqueeze(3)).view(_H, _I)
 
 
 @torch.compile(fullgraph=True, dynamic=True)
@@ -140,15 +141,14 @@ def kernel(
 
         tok_idx = sel.nonzero(as_tuple=False).squeeze(1)
 
-        A_bf16   = _dequant_A(hidden_states[tok_idx], A_scale[tok_idx])
-        W13_bf16 = _dequant_W13(gemm1_weights[le], gemm1_weights_scale[le])
-        C_full   = torch.mm(A_bf16, W13_bf16.t())     # GEMM1: cuBLAS bf16 TC
+        A_fp32   = _dequant_A(hidden_states[tok_idx], A_scale[tok_idx])
+        W13_fp32 = _dequant_W13(gemm1_weights[le], gemm1_weights_scale[le])
+        C_full   = torch.mm(A_fp32, W13_fp32.t())     # GEMM1: cuBLAS TF32
         C        = _swiglu(C_full)
-        W2_bf16  = _dequant_W2(gemm2_weights[le], gemm2_weights_scale[le])
-        O        = torch.mm(C, W2_bf16.t())            # GEMM2: cuBLAS bf16 TC
+        W2_fp32  = _dequant_W2(gemm2_weights[le], gemm2_weights_scale[le])
+        O        = torch.mm(C, W2_fp32.t())            # GEMM2: cuBLAS TF32
 
         w_tok = weights_scaled[tok_idx, ge]
-        # O is bf16; w_tok is fp32 → product promotes to fp32 for index_add_
         out_f32.index_add_(0, tok_idx, O * w_tok.unsqueeze(1))
 
     _finalize(out_f32, output)
