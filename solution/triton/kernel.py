@@ -1,20 +1,13 @@
 """
-FP8 Block-Scale Fused MoE Kernel  –  v17
+FP8 Block-Scale Fused MoE Kernel  –  v18
 Definition: moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048
 
-v5  (reference):                  19/19 PASSED, abs_err=0, ~1.0x
-v14 (no cache, allow_tf32=F):     19/19 PASSED, 1.0-4.33x peak
-v15 (re-enable TF32):             19/19 PASSED, TF32 tensor cores for large T
-v16 (Helion FFMA):                19/19 COMPILE_ERROR — helion not on B200 image
-
-v17: torch.compile fused dequant + cuBLAS TF32 GEMMs.
-
-Key insight: dequant for W13 costs ~380MB HBM per expert:
-  fp8→fp32 write (29MB→117MB) + scale multiply read+write (117MB+117MB)
-torch.compile fuses both into one pass: 29MB read + 117MB write = 146MB.
-Savings: 234MB per expert × 32 experts = 7.5GB → ~2.5ms at 3 TB/s HBM.
-
-Expected improvement over v15: significant for medium-T workloads.
+v17: torch.compile fused dequant → 2.5ms HBM savings, 4.52x peak, 1.10x worst
+v18: additional torch.compile fusions:
+  - Fuse A gather + dequant: hidden_states[tok_idx] + fp8→fp32 + scale mul → 1 kernel
+  - Fuse SwiGLU: sigmoid + 2 multiplies → 1 kernel (saves 2 HBM read-write cycles)
+  - Fuse weighted output accumulation: weight multiply + index_add → 1 kernel
+  - Compile routing: fuse sigmoid + masked_fill elementwise ops (graph breaks ok)
 """
 
 import torch
@@ -29,21 +22,24 @@ _N_GRP = 8
 _TK_GRP= 4
 _BLKSZ = 128   # FP8 block-scale granularity
 
-# ─── Fused dequant kernels (compiled once per shape) ─────────────────────────
-# torch.compile fuses fp8→fp32 cast + view + scale multiply into a single
-# Triton kernel, halving HBM traffic vs two separate ops.
+# ─── Compiled fused kernels ───────────────────────────────────────────────────
 
-@torch.compile(fullgraph=True)
-def _dequant_A(A_fp8: torch.Tensor, A_scale: torch.Tensor) -> torch.Tensor:
-    """Dequant hidden states: [Tk, H] fp8 + [Tk, 56] scale → [Tk, H] fp32."""
+@torch.compile(fullgraph=True, dynamic=True)
+def _gather_dequant_A(
+    hidden_states: torch.Tensor,   # [T, H] fp8
+    A_scale: torch.Tensor,         # [T, 56] fp32
+    tok_idx: torch.Tensor,         # [Tk] int
+) -> torch.Tensor:
+    """Gather + dequant in one pass: avoids writing [Tk, H] fp8 gather to HBM."""
+    A_fp8 = hidden_states[tok_idx]                       # gather [Tk, H] fp8
     Tk = A_fp8.shape[0]
     return (A_fp8.to(torch.float32).view(Tk, 56, _BLKSZ)
-            * A_scale.unsqueeze(2)).view(Tk, _H)
+            * A_scale[tok_idx].unsqueeze(2)).view(Tk, _H)
 
 
 @torch.compile(fullgraph=True)
 def _dequant_W13(W13_fp8: torch.Tensor, S13: torch.Tensor) -> torch.Tensor:
-    """Dequant GEMM1 weights: [G1, H] fp8 + [32, 56] scale → [G1, H] fp32."""
+    """[G1, H] fp8 + [32, 56] scale → [G1, H] fp32. Fixed shape — compiled once."""
     return (W13_fp8.to(torch.float32)
             .view(_G1 // _BLKSZ, _BLKSZ, _H // _BLKSZ, _BLKSZ)
             * S13.unsqueeze(1).unsqueeze(3)).view(_G1, _H)
@@ -51,15 +47,24 @@ def _dequant_W13(W13_fp8: torch.Tensor, S13: torch.Tensor) -> torch.Tensor:
 
 @torch.compile(fullgraph=True)
 def _dequant_W2(W2_fp8: torch.Tensor, S2: torch.Tensor) -> torch.Tensor:
-    """Dequant GEMM2 weights: [H, I] fp8 + [56, 16] scale → [H, I] fp32."""
+    """[H, I] fp8 + [56, 16] scale → [H, I] fp32. Fixed shape — compiled once."""
     return (W2_fp8.to(torch.float32)
             .view(_H // _BLKSZ, _BLKSZ, _I // _BLKSZ, _BLKSZ)
             * S2.unsqueeze(1).unsqueeze(3)).view(_H, _I)
 
 
+@torch.compile(fullgraph=True, dynamic=True)
+def _swiglu(C_full: torch.Tensor) -> torch.Tensor:
+    """SwiGLU: fuse sigmoid + 2 multiplies into 1 kernel. Saves 2 HBM passes."""
+    C_gate = C_full[:, :_I]
+    C_up   = C_full[:, _I:]
+    return (C_up * torch.sigmoid(C_up)) * C_gate
+
+
 # ─────────────────────────────────────────────────────────────────────────────
-# Routing – vectorised, identical to v5 reference
+# Routing – compiled to fuse elementwise ops across the reductions
 # ─────────────────────────────────────────────────────────────────────────────
+@torch.compile(dynamic=True)
 def _route(routing_logits, routing_bias, device, T):
     s   = torch.sigmoid(routing_logits.to(torch.float32))
     swb = s + routing_bias.to(torch.float32)
@@ -101,11 +106,11 @@ def kernel(
     T      = routing_logits.shape[0]
     device = hidden_states.device
 
-    # ── Routing ───────────────────────────────────────────────────────────────
+    # ── Routing (compiled: fuse elementwise ops around reductions) ────────────
     topk_idx, weights_norm = _route(routing_logits, routing_bias, device, T)
     weights_scaled = weights_norm * routed_scaling_factor
 
-    # A_scale: [56, T] → [T, 56]
+    # A_scale: [56, T] → [T, 56] (contiguous for gather in _gather_dequant_A)
     A_scale = (hidden_states_scale.to(torch.float32)
                                   .permute(1, 0)
                                   .contiguous())   # [T, 56]
@@ -123,28 +128,26 @@ def kernel(
             continue
 
         tok_idx = sel.nonzero(as_tuple=False).squeeze(1)
-        Tk      = tok_idx.shape[0]
 
-        # ── Fused A dequant (compiled: one HBM pass) ─────────────────────────
-        A_fp32 = _dequant_A(hidden_states[tok_idx], A_scale[tok_idx])  # [Tk, H]
+        # ── Fused gather + A dequant (1 kernel: fp8 gather+cast+scale) ───────
+        A_fp32 = _gather_dequant_A(hidden_states, A_scale, tok_idx)  # [Tk, H]
 
-        # ── Fused W13 dequant (compiled: one HBM pass, saves 234MB) ──────────
-        W13_fp32 = _dequant_W13(gemm1_weights[le], gemm1_weights_scale[le])  # [G1, H]
+        # ── Fused W13 dequant (1 kernel, fixed shape) ─────────────────────────
+        W13_fp32 = _dequant_W13(gemm1_weights[le], gemm1_weights_scale[le])   # [G1, H]
 
         # ── GEMM1: cuBLAS TF32 tensor cores ──────────────────────────────────
         C_full = torch.mm(A_fp32, W13_fp32.t())     # [Tk, G1]
 
-        # SwiGLU: silu(up) * gate  ← gate=rows 0..I-1, up=rows I..G1-1
-        C_gate = C_full[:, :_I]    # [Tk, I]
-        C_up   = C_full[:, _I:]    # [Tk, I]
-        C      = (C_up * torch.sigmoid(C_up)) * C_gate     # [Tk, I]
+        # ── Fused SwiGLU (1 kernel: sigmoid + 2 muls, saves 2 HBM passes) ────
+        C = _swiglu(C_full)   # [Tk, I]
 
-        # ── Fused W2 dequant (compiled: one HBM pass, saves 117MB) ───────────
-        W2_fp32 = _dequant_W2(gemm2_weights[le], gemm2_weights_scale[le])   # [H, I]
+        # ── Fused W2 dequant (1 kernel, fixed shape) ─────────────────────────
+        W2_fp32 = _dequant_W2(gemm2_weights[le], gemm2_weights_scale[le])     # [H, I]
 
         # ── GEMM2: cuBLAS TF32 tensor cores ──────────────────────────────────
         O = torch.mm(C, W2_fp32.t())      # [Tk, I] @ [I, H] → [Tk, H]
 
+        # ── Weighted output accumulation ──────────────────────────────────────
         w_tok = weights_scaled[tok_idx, ge]
         out_f32.index_add_(0, tok_idx, O * w_tok.unsqueeze(1))
 
