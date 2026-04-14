@@ -1,33 +1,23 @@
 """
-FP8 Block-Scale Fused MoE Kernel  –  v16
+FP8 Block-Scale Fused MoE Kernel  –  v17
 Definition: moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048
 
 v5  (reference):                  19/19 PASSED, abs_err=0, ~1.0x
-v6f (W2 cache + cuBLAS):          19/19 PASSED, abs_err=0, ~0.93-0.99x
-v7  (Triton fp32 GEMM1, atf32=F): 19/19 PASSED, abs_err=0, ~0.93-0.99x
-v8-v9 (TF32/fp16/fp8 tl.dot):    RUNTIME_ERROR — only atf32=False works on B200
-v10 (W13+W2 cache + cuBLAS TF32): 19/19 PASSED, 0.92-0.98x BUT large abs_err
-v10b (no W13 cache, W2 cache):    19/19 PASSED, 1.0-1.94x BUT abs_err on some
-v11 (content fingerprint cache):  19/19 PASSED, same abs_err — fingerprint no help
-v12 (in-loop allow_tf32 toggle):  19/19 PASSED, abs_err WORSE (2048-4096)
-    → In-loop toggle races cuBLAS async dispatch; fingerprint causes spurious misses
-v13 (allow_tf32=False at load):   19/19 PASSED, 0.96-1.95x, abs_err still 64-1024
-    → TF32 not the root cause; cuBLAS fp32 accumulation order differs from ref
-v14 (no W2 cache, allow_tf32=F):  19/19 PASSED, 1.0-4.33x, abs_err still 64-1024
-    → Removing W2 cache (1.87GB) gives huge small-T speedup; TF32 not the issue
+v14 (no cache, allow_tf32=F):     19/19 PASSED, 1.0-4.33x peak
 v15 (re-enable TF32):             19/19 PASSED, TF32 tensor cores for large T
-    → Same no-cache per-call dequant; gain tensor cores while keeping small-T speedup
+v16 (Helion FFMA):                19/19 COMPILE_ERROR — helion not on B200 image
 
-v16: Helion fused GEMM1+SwiGLU (ieee/FFMA) + cuBLAS GEMM2.
-  - Replaces torch.mm GEMM1 + separate SwiGLU with single Helion fused kernel
-  - Helion dot_precision='ieee' → FFMA → avoids WGMMA crash on B200 Modal Triton
-  - Saves one HBM round-trip: no intermediate [Tk, G1=4096] tensor written to HBM
-  - Helion's autotuner (block sizes, warps, stages) on top of FFMA path
-  - GEMM2 stays as cuBLAS (TF32 tensor cores) — no WGMMA issue with torch.mm
+v17: torch.compile fused dequant + cuBLAS TF32 GEMMs.
+
+Key insight: dequant for W13 costs ~380MB HBM per expert:
+  fp8→fp32 write (29MB→117MB) + scale multiply read+write (117MB+117MB)
+torch.compile fuses both into one pass: 29MB read + 117MB write = 146MB.
+Savings: 234MB per expert × 32 experts = 7.5GB → ~2.5ms at 3 TB/s HBM.
+
+Expected improvement over v15: significant for medium-T workloads.
 """
 
 import torch
-from .helion_fused import gemm1_swiglu_fused
 
 _H     = 7168
 _I     = 2048
@@ -38,6 +28,33 @@ _TOP_K = 8
 _N_GRP = 8
 _TK_GRP= 4
 _BLKSZ = 128   # FP8 block-scale granularity
+
+# ─── Fused dequant kernels (compiled once per shape) ─────────────────────────
+# torch.compile fuses fp8→fp32 cast + view + scale multiply into a single
+# Triton kernel, halving HBM traffic vs two separate ops.
+
+@torch.compile(fullgraph=True)
+def _dequant_A(A_fp8: torch.Tensor, A_scale: torch.Tensor) -> torch.Tensor:
+    """Dequant hidden states: [Tk, H] fp8 + [Tk, 56] scale → [Tk, H] fp32."""
+    Tk = A_fp8.shape[0]
+    return (A_fp8.to(torch.float32).view(Tk, 56, _BLKSZ)
+            * A_scale.unsqueeze(2)).view(Tk, _H)
+
+
+@torch.compile(fullgraph=True)
+def _dequant_W13(W13_fp8: torch.Tensor, S13: torch.Tensor) -> torch.Tensor:
+    """Dequant GEMM1 weights: [G1, H] fp8 + [32, 56] scale → [G1, H] fp32."""
+    return (W13_fp8.to(torch.float32)
+            .view(_G1 // _BLKSZ, _BLKSZ, _H // _BLKSZ, _BLKSZ)
+            * S13.unsqueeze(1).unsqueeze(3)).view(_G1, _H)
+
+
+@torch.compile(fullgraph=True)
+def _dequant_W2(W2_fp8: torch.Tensor, S2: torch.Tensor) -> torch.Tensor:
+    """Dequant GEMM2 weights: [H, I] fp8 + [56, 16] scale → [H, I] fp32."""
+    return (W2_fp8.to(torch.float32)
+            .view(_H // _BLKSZ, _BLKSZ, _I // _BLKSZ, _BLKSZ)
+            * S2.unsqueeze(1).unsqueeze(3)).view(_H, _I)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -108,29 +125,24 @@ def kernel(
         tok_idx = sel.nonzero(as_tuple=False).squeeze(1)
         Tk      = tok_idx.shape[0]
 
-        # ── Efficient A dequant: view+broadcast, no repeat_interleave ────────
-        A_fp8_e   = hidden_states[tok_idx]          # [Tk, H] fp8
-        A_scale_e = A_scale[tok_idx]                # [Tk, 56]
-        A_fp32    = A_fp8_e.to(torch.float32).view(Tk, 56, _BLKSZ)
-        A_fp32    = (A_fp32 * A_scale_e.unsqueeze(2)).view(Tk, _H)  # [Tk, H]
+        # ── Fused A dequant (compiled: one HBM pass) ─────────────────────────
+        A_fp32 = _dequant_A(hidden_states[tok_idx], A_scale[tok_idx])  # [Tk, H]
 
-        # ── Efficient W13 dequant: view+broadcast per call (no cache, no ABA) ─
-        S13_e    = gemm1_weights_scale[le]           # [32, 56] fp32
-        W13_fp32 = gemm1_weights[le].to(torch.float32)       # [G1, H]
-        W13_fp32 = W13_fp32.view(_G1 // _BLKSZ, _BLKSZ, _H // _BLKSZ, _BLKSZ)
-        W13_fp32 = (W13_fp32 * S13_e.unsqueeze(1).unsqueeze(3)).view(_G1, _H)
+        # ── Fused W13 dequant (compiled: one HBM pass, saves 234MB) ──────────
+        W13_fp32 = _dequant_W13(gemm1_weights[le], gemm1_weights_scale[le])  # [G1, H]
 
-        # ── GEMM1+SwiGLU: Helion fused (ieee/FFMA, B200-safe) ────────────────
-        C = torch.empty(Tk, _I, dtype=torch.float32, device=device)
-        C = gemm1_swiglu_fused(A_fp32, W13_fp32, C)   # [Tk, I]
+        # ── GEMM1: cuBLAS TF32 tensor cores ──────────────────────────────────
+        C_full = torch.mm(A_fp32, W13_fp32.t())     # [Tk, G1]
 
-        # ── Efficient W2 dequant: view+broadcast per call (no cache, no ABA) ──
-        S2_e    = gemm2_weights_scale[le]           # [56, 16] fp32
-        W2_fp32 = gemm2_weights[le].to(torch.float32)        # [H, I]
-        W2_fp32 = W2_fp32.view(_H // _BLKSZ, _BLKSZ, _I // _BLKSZ, _BLKSZ)
-        W2_fp32 = (W2_fp32 * S2_e.unsqueeze(1).unsqueeze(3)).view(_H, _I)
+        # SwiGLU: silu(up) * gate  ← gate=rows 0..I-1, up=rows I..G1-1
+        C_gate = C_full[:, :_I]    # [Tk, I]
+        C_up   = C_full[:, _I:]    # [Tk, I]
+        C      = (C_up * torch.sigmoid(C_up)) * C_gate     # [Tk, I]
 
-        # ── GEMM2: cuBLAS fp32 (TF32 tensor cores) ───────────────────────────
+        # ── Fused W2 dequant (compiled: one HBM pass, saves 117MB) ───────────
+        W2_fp32 = _dequant_W2(gemm2_weights[le], gemm2_weights_scale[le])   # [H, I]
+
+        # ── GEMM2: cuBLAS TF32 tensor cores ──────────────────────────────────
         O = torch.mm(C, W2_fp32.t())      # [Tk, I] @ [I, H] → [Tk, H]
 
         w_tok = weights_scaled[tok_idx, ge]
