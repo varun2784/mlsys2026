@@ -1,22 +1,19 @@
 """
-FP8 Block-Scale Fused MoE Kernel  –  v21 (= v18c restored)
+FP8 Block-Scale Fused MoE Kernel  –  v22
 Definition: moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048
 
-Version history:
-v14 (no cache, no TF32):     19/19 PASSED, 1.0-4.33x peak
-v17 (torch.compile dequant): 19/19 PASSED, 1.10-4.52x, geomean ~1.66x
-v18c (+ compiled SwiGLU):    19/19 PASSED, 1.20-7.16x, geomean ~2.54x  ← BEST
-v19 (full expert compiled):  19/19 PASSED, WORSE — inductor GEMM < cuBLAS
-v20 (+ compiled accum):      19/19 PASSED, WORSE — dynamic=True hurts small-T
-v21: restore v18c (confirmed best configuration)
+v21 (= v18c): 19/19 PASSED, geomean ~1.74x over ref, peak ~4.4x
+v22: add two more torch.compile fusions:
+  - _prep_A_scale: fuse bf16→fp32 + permute + contiguous into 1 kernel
+  - _finalize: fuse fp32→bf16 output conversion into 1 compiled kernel
+    (saves intermediate bf16 tensor, ~T*H*2 bytes for large T)
 
-Key techniques:
-1. Expert skipping: if not sel.any(): continue (critical for small-T speedup)
-2. view+broadcast dequant: no cache, no ABA, per-call for W13/W2
-3. torch.compile fused dequant: fuses fp8→fp32 + scale mul into 1 Triton kernel
-4. torch.compile SwiGLU with dynamic=True: fuses sigmoid + 2 muls, handles
-   non-contiguous C_full slices via strided Triton loads (saves ~1.4ms large-T)
-5. cuBLAS TF32 for GEMM1 + GEMM2 (tensor cores, not WGMMA which crashes on B200)
+Key techniques (all from v17/v18c):
+1. Expert skipping: if not sel.any(): continue
+2. view+broadcast per-call dequant (no cache → no ABA)
+3. torch.compile W13/W2/A dequant: fp8→fp32 + scale mul fused
+4. torch.compile SwiGLU with dynamic=True: strided loads handle non-contiguous
+5. cuBLAS TF32 GEMMs (tensor cores; Triton WGMMA crashes on B200 Modal)
 """
 
 import torch
@@ -55,6 +52,18 @@ def _dequant_W2(W2_fp8: torch.Tensor, S2: torch.Tensor) -> torch.Tensor:
     return (W2_fp8.to(torch.float32)
             .view(_H // _BLKSZ, _BLKSZ, _I // _BLKSZ, _BLKSZ)
             * S2.unsqueeze(1).unsqueeze(3)).view(_H, _I)
+
+
+@torch.compile(fullgraph=True, dynamic=True)
+def _prep_A_scale(scale: torch.Tensor) -> torch.Tensor:
+    """[56, T] bf16/f32 → [T, 56] f32. Fuse cast + transpose + contiguous."""
+    return scale.to(torch.float32).permute(1, 0).contiguous()
+
+
+@torch.compile(fullgraph=True, dynamic=True)
+def _finalize(out_f32: torch.Tensor, output: torch.Tensor) -> None:
+    """Fuse fp32→bf16 cast + copy into 1 kernel. Avoids intermediate bf16 tensor."""
+    output.copy_(out_f32.to(torch.bfloat16))
 
 
 @torch.compile(fullgraph=True, dynamic=True)
@@ -114,10 +123,8 @@ def kernel(
     topk_idx, weights_norm = _route(routing_logits, routing_bias, device, T)
     weights_scaled = weights_norm * routed_scaling_factor
 
-    # A_scale: [56, T] → [T, 56]
-    A_scale = (hidden_states_scale.to(torch.float32)
-                                  .permute(1, 0)
-                                  .contiguous())   # [T, 56]
+    # A_scale: [56, T] → [T, 56] (fused cast + transpose + contiguous)
+    A_scale = _prep_A_scale(hidden_states_scale)   # [T, 56]
 
     out_f32     = torch.zeros(T, _H, dtype=torch.float32, device=device)
     local_start = int(local_expert_offset)
@@ -143,4 +150,4 @@ def kernel(
         w_tok = weights_scaled[tok_idx, ge]
         out_f32.index_add_(0, tok_idx, O * w_tok.unsqueeze(1))
 
-    output.copy_(out_f32.to(torch.bfloat16))
+    _finalize(out_f32, output)
