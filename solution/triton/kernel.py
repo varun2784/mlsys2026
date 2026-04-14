@@ -1,13 +1,12 @@
 """
-FP8 Block-Scale Fused MoE Kernel  –  v18
+FP8 Block-Scale Fused MoE Kernel  –  v18b
 Definition: moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048
 
-v17: torch.compile fused dequant → 2.5ms HBM savings, 4.52x peak, 1.10x worst
-v18: additional torch.compile fusions:
+v17: torch.compile W13/W2 dequant → 2.5ms HBM savings, 4.52x peak, 1.10x worst
+v18: additional fusions — routing kept eager (compile caused -0.44x regression):
   - Fuse A gather + dequant: hidden_states[tok_idx] + fp8→fp32 + scale mul → 1 kernel
   - Fuse SwiGLU: sigmoid + 2 multiplies → 1 kernel (saves 2 HBM read-write cycles)
-  - Fuse weighted output accumulation: weight multiply + index_add → 1 kernel
-  - Compile routing: fuse sigmoid + masked_fill elementwise ops (graph breaks ok)
+  - Routing: remains eager (scatter_ ops cause graph breaks, hurt small-T perf)
 """
 
 import torch
@@ -62,9 +61,8 @@ def _swiglu(C_full: torch.Tensor) -> torch.Tensor:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Routing – compiled to fuse elementwise ops across the reductions
+# Routing – kept eager: scatter_ causes graph breaks, compile hurts small-T
 # ─────────────────────────────────────────────────────────────────────────────
-@torch.compile(dynamic=True)
 def _route(routing_logits, routing_bias, device, T):
     s   = torch.sigmoid(routing_logits.to(torch.float32))
     swb = s + routing_bias.to(torch.float32)
