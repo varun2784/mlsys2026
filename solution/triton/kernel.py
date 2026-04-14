@@ -1,5 +1,5 @@
 """
-FP8 Block-Scale Fused MoE Kernel  –  v13
+FP8 Block-Scale Fused MoE Kernel  –  v16
 Definition: moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048
 
 v5  (reference):                  19/19 PASSED, abs_err=0, ~1.0x
@@ -11,24 +11,23 @@ v10b (no W13 cache, W2 cache):    19/19 PASSED, 1.0-1.94x BUT abs_err on some
 v11 (content fingerprint cache):  19/19 PASSED, same abs_err — fingerprint no help
 v12 (in-loop allow_tf32 toggle):  19/19 PASSED, abs_err WORSE (2048-4096)
     → In-loop toggle races cuBLAS async dispatch; fingerprint causes spurious misses
-
 v13 (allow_tf32=False at load):   19/19 PASSED, 0.96-1.95x, abs_err still 64-1024
     → TF32 not the root cause; cuBLAS fp32 accumulation order differs from ref
+v14 (no W2 cache, allow_tf32=F):  19/19 PASSED, 1.0-4.33x, abs_err still 64-1024
+    → Removing W2 cache (1.87GB) gives huge small-T speedup; TF32 not the issue
+v15 (re-enable TF32):             19/19 PASSED, TF32 tensor cores for large T
+    → Same no-cache per-call dequant; gain tensor cores while keeping small-T speedup
 
-v14: drop W2 cache entirely — per-call view+broadcast dequant for both W13 and W2.
-  - No caching at all → no ABA possible
-  - Speedup: 1.0-4.33x — skipping empty experts makes per-call dequant cheap
-  - abs_err still nonzero on 3 workloads (cuBLAS vs ref accumulation order)
-  - allow_tf32=False (lost tensor core throughput for large T)
-
-v15: re-enable TF32 — abs_err not from TF32 (proved by v13/v14), gain tensor cores.
-  - allow_tf32=True (default) → TF32 tensor cores for large-T compute-bound GEMMs
-  - Keep no-cache per-call view+broadcast dequant (key to small-T speedup)
-  - Target: maintain 4.33x small-T + improve large-T from 1.0x toward 2x+
+v16: Helion fused GEMM1+SwiGLU (ieee/FFMA) + cuBLAS GEMM2.
+  - Replaces torch.mm GEMM1 + separate SwiGLU with single Helion fused kernel
+  - Helion dot_precision='ieee' → FFMA → avoids WGMMA crash on B200 Modal Triton
+  - Saves one HBM round-trip: no intermediate [Tk, G1=4096] tensor written to HBM
+  - Helion's autotuner (block sizes, warps, stages) on top of FFMA path
+  - GEMM2 stays as cuBLAS (TF32 tensor cores) — no WGMMA issue with torch.mm
 """
 
 import torch
-import torch.nn.functional as F
+from .helion_fused import gemm1_swiglu_fused
 
 _H     = 7168
 _I     = 2048
@@ -39,7 +38,6 @@ _TOP_K = 8
 _N_GRP = 8
 _TK_GRP= 4
 _BLKSZ = 128   # FP8 block-scale granularity
-
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -122,13 +120,9 @@ def kernel(
         W13_fp32 = W13_fp32.view(_G1 // _BLKSZ, _BLKSZ, _H // _BLKSZ, _BLKSZ)
         W13_fp32 = (W13_fp32 * S13_e.unsqueeze(1).unsqueeze(3)).view(_G1, _H)
 
-        # ── GEMM1: cuBLAS fp32 (allow_tf32=False set at module load) ─────────
-        C_full = torch.mm(A_fp32, W13_fp32.t())     # [Tk, G1]
-
-        # SwiGLU: silu(up) * gate  ← gate=rows 0..I-1, up=rows I..G1-1
-        C_gate = C_full[:, :_I]    # [Tk, I]
-        C_up   = C_full[:, _I:]    # [Tk, I]
-        C      = (C_up * torch.sigmoid(C_up)) * C_gate     # [Tk, I]
+        # ── GEMM1+SwiGLU: Helion fused (ieee/FFMA, B200-safe) ────────────────
+        C = torch.empty(Tk, _I, dtype=torch.float32, device=device)
+        C = gemm1_swiglu_fused(A_fp32, W13_fp32, C)   # [Tk, I]
 
         # ── Efficient W2 dequant: view+broadcast per call (no cache, no ABA) ──
         S2_e    = gemm2_weights_scale[le]           # [56, 16] fp32
@@ -136,7 +130,7 @@ def kernel(
         W2_fp32 = W2_fp32.view(_H // _BLKSZ, _BLKSZ, _I // _BLKSZ, _BLKSZ)
         W2_fp32 = (W2_fp32 * S2_e.unsqueeze(1).unsqueeze(3)).view(_H, _I)
 
-        # ── GEMM2: cuBLAS fp32 ───────────────────────────────────────────────
+        # ── GEMM2: cuBLAS fp32 (TF32 tensor cores) ───────────────────────────
         O = torch.mm(C, W2_fp32.t())      # [Tk, I] @ [I, H] → [Tk, H]
 
         w_tok = weights_scaled[tok_idx, ge]
