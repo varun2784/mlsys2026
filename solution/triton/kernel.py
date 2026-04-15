@@ -1,16 +1,16 @@
 """
-FP8 Block-Scale Fused MoE Kernel  –  v25
+FP8 Block-Scale Fused MoE Kernel  –  v26
 Definition: moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048
 
 v22: geomean ~1.69x
-v24: dynamic=True on _dequant_A → regressed to ~1.47x (reverted)
-v25: batch expert selection to eliminate 32 CPU-GPU syncs → 1
-  - Old: 32 × (topk_idx == ge).any(dim=1).any() → 32 GPU-CPU syncs
-  - New: one [32, T, 8] comparison → active_les.tolist() → 1 GPU-CPU sync
-  - For workloads with few active experts, saves up to 31 spurious syncs.
+v25: batch expert selection (broadcast) → geomean ~1.97x
+v26: replace O(T×8×32) broadcast with O(T×8) scatter for expert selection
+  - Old v25: [32, T, 8] broadcast comparison (32× more ops, 8× more memory)
+  - New v26: [T, 8] subtract + scatter → [T, 32] → [32, T]: 32× fewer ops
+  - For large T: saves ~12MB intermediate tensor ([32,T,8]=12.8MB → [T,32]=1.6MB)
 
 Key techniques (all from v17/v18c):
-1. Expert skipping: one batched pass finds all active experts
+1. Expert skipping: O(T×8) scatter finds all active experts, 1 GPU-CPU sync
 2. view+broadcast per-call dequant (no cache → no ABA)
 3. torch.compile dequant: fp8→fp32 + scale mul fused
 4. torch.compile SwiGLU with dynamic=True: strided loads handle non-contiguous
@@ -130,17 +130,16 @@ def kernel(
     out_f32     = torch.zeros(T, _H, dtype=torch.float32, device=device)
     local_start = int(local_expert_offset)
 
-    # ── Batch expert selection: one [E_LOC, T, 8] pass → 1 GPU-CPU sync ──────
-    # Build ge indices for valid local experts
-    le_range = torch.arange(_E_LOC, device=device)
-    ge_range = le_range + local_start                              # [E_LOC]
-    valid    = (ge_range >= 0) & (ge_range < _E_GLB)             # [E_LOC]
+    # ── Batch expert selection: O(T×8) scatter → 1 GPU-CPU sync ─────────────
+    # local_topk[t, k] = topk_idx[t, k] - local_start  (local expert index)
+    local_topk = topk_idx - local_start                           # [T, 8]
+    in_range   = (local_topk >= 0) & (local_topk < _E_LOC)      # [T, 8]
 
-    # all_sel[le, t] = True if token t routes to expert (local_start + le)
-    # topk_idx: [T, 8] → compare with ge_range [E_LOC, 1, 1]
-    all_match = (topk_idx.unsqueeze(0) == ge_range.view(_E_LOC, 1, 1))  # [E, T, 8]
-    all_sel   = all_match.any(dim=2) & valid.unsqueeze(1)         # [E_LOC, T]
-    active    = all_sel.any(dim=1)                                # [E_LOC]
+    # all_sel_T[t, le] = True if token t routes to local expert le
+    all_sel_T  = torch.zeros(T, _E_LOC, dtype=torch.bool, device=device)
+    all_sel_T.scatter_(1, local_topk.clamp(0, _E_LOC - 1).long(), in_range)
+    all_sel    = all_sel_T.t().contiguous()                       # [E_LOC, T]
+    active     = all_sel.any(dim=1)                               # [E_LOC]
 
     # One sync: get list of active local expert indices
     for le in active.nonzero(as_tuple=False).squeeze(1).tolist():
