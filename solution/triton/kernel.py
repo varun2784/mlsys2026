@@ -1,16 +1,17 @@
 """
-FP8 Block-Scale Fused MoE Kernel  –  v27
+FP8 Block-Scale Fused MoE Kernel  –  v28
 Definition: moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048
 
 v22: geomean ~1.69x
-v25: batch expert selection (broadcast) → geomean ~1.97x
-v26/v26b: O(T×8) scatter → ~1.88x (regression, reverted)
-v27: compile the batch selection (broadcast+any+any) → fewer kernel launches
-  - Fuse [32,T,8] comparison + any(dim=2) + mask + any(dim=1) into 1 compiled kernel
-  - Also compile the nonzero step inside the per-expert tok_idx computation
+v25: batch expert selection (1 GPU-CPU sync) → geomean ~1.97x  ← best
+v26/v26b: scatter → ~1.88x (regression, reverted)
+v27: compiled _batch_select → ~1.92x (dynamic=True overhead, reverted)
+v28: module-level _LE_RANGE to avoid torch.arange allocation per call
+  - Precompute [0..31] arange once, reuse via .to(device) (no-op if on GPU)
+  - Inline batch selection (no compile overhead)
 
 Key techniques (all from v17/v18c):
-1. Expert skipping: compiled batch selection, 1 GPU-CPU sync
+1. Expert skipping: one batched broadcast finds all active experts, 1 sync
 2. view+broadcast per-call dequant (no cache → no ABA)
 3. torch.compile dequant: fp8→fp32 + scale mul fused
 4. torch.compile SwiGLU with dynamic=True: strided loads handle non-contiguous
@@ -28,6 +29,10 @@ _TOP_K = 8
 _N_GRP = 8
 _TK_GRP= 4
 _BLKSZ = 128   # FP8 block-scale granularity
+
+# Precomputed local expert index range (reused across calls, moved to GPU lazily)
+_LE_RANGE_CPU = torch.arange(_E_LOC)   # [0..31] on CPU
+_LE_RANGE_GPU: torch.Tensor | None = None
 
 # ─── Compiled fused kernels ───────────────────────────────────────────────────
 
@@ -53,20 +58,6 @@ def _dequant_W2(W2_fp8: torch.Tensor, S2: torch.Tensor) -> torch.Tensor:
     return (W2_fp8.to(torch.float32)
             .view(_H // _BLKSZ, _BLKSZ, _I // _BLKSZ, _BLKSZ)
             * S2.unsqueeze(1).unsqueeze(3)).view(_H, _I)
-
-
-@torch.compile(fullgraph=True, dynamic=True)
-def _batch_select(
-    topk_idx: torch.Tensor,   # [T, 8]
-    ge_range: torch.Tensor,   # [E_LOC]
-    valid:    torch.Tensor,   # [E_LOC] bool
-):
-    """Fused broadcast+any: returns all_sel [E,T] and active [E] in one compiled kernel."""
-    E = ge_range.shape[0]
-    all_match = (topk_idx.unsqueeze(0) == ge_range.view(E, 1, 1))  # [E, T, 8]
-    all_sel   = all_match.any(dim=2) & valid.unsqueeze(1)           # [E, T]
-    active    = all_sel.any(dim=1)                                  # [E]
-    return all_sel, active
 
 
 @torch.compile(fullgraph=True, dynamic=True)
@@ -144,10 +135,15 @@ def kernel(
     out_f32     = torch.zeros(T, _H, dtype=torch.float32, device=device)
     local_start = int(local_expert_offset)
 
-    # ── Batch expert selection: compiled broadcast+any → 1 GPU-CPU sync ──────
-    ge_range = torch.arange(_E_LOC, device=device) + local_start  # [E_LOC]
-    valid    = (ge_range >= 0) & (ge_range < _E_GLB)              # [E_LOC]
-    all_sel, active = _batch_select(topk_idx, ge_range, valid)    # [E,T], [E]
+    # ── Batch expert selection: one broadcast pass → 1 GPU-CPU sync ──────────
+    global _LE_RANGE_GPU
+    if _LE_RANGE_GPU is None or _LE_RANGE_GPU.device != device:
+        _LE_RANGE_GPU = _LE_RANGE_CPU.to(device)
+    ge_range  = _LE_RANGE_GPU + local_start                       # [E_LOC]
+    valid     = (ge_range >= 0) & (ge_range < _E_GLB)            # [E_LOC]
+    all_match = (topk_idx.unsqueeze(0) == ge_range.view(_E_LOC, 1, 1))  # [E, T, 8]
+    all_sel   = all_match.any(dim=2) & valid.unsqueeze(1)         # [E_LOC, T]
+    active    = all_sel.any(dim=1)                                # [E_LOC]
 
     # One sync: get list of active local expert indices
     for le in active.nonzero(as_tuple=False).squeeze(1).tolist():
