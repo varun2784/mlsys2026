@@ -1,17 +1,16 @@
 """
-FP8 Block-Scale Fused MoE Kernel  –  v28
+FP8 Block-Scale Fused MoE Kernel  –  v29
 Definition: moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048
 
 v22: geomean ~1.69x
-v25: batch expert selection (1 GPU-CPU sync) → geomean ~1.97x  ← best
-v26/v26b: scatter → ~1.88x (regression, reverted)
-v27: compiled _batch_select → ~1.92x (dynamic=True overhead, reverted)
-v28: module-level _LE_RANGE to avoid torch.arange allocation per call
-  - Precompute [0..31] arange once, reuse via .to(device) (no-op if on GPU)
-  - Inline batch selection (no compile overhead)
+v25: batch expert selection (1 GPU-CPU sync) → geomean ~1.97x
+v28: precomputed _LE_RANGE_GPU → geomean ~2.01x  ← best so far
+v29: remove valid mask (always all-True: local_offset ∈ {0,32,...,224})
+  - For E_GLB=256, E_LOC=32: ge_range ⊆ [0,255] whenever offset is valid.
+  - Saves one GPU kernel launch ([E,T] AND with all-True bool mask).
 
 Key techniques (all from v17/v18c):
-1. Expert skipping: one batched broadcast finds all active experts, 1 sync
+1. Expert skipping: one batched broadcast, 1 GPU-CPU sync, no valid mask overhead
 2. view+broadcast per-call dequant (no cache → no ABA)
 3. torch.compile dequant: fp8→fp32 + scale mul fused
 4. torch.compile SwiGLU with dynamic=True: strided loads handle non-contiguous
@@ -140,9 +139,8 @@ def kernel(
     if _LE_RANGE_GPU is None or _LE_RANGE_GPU.device != device:
         _LE_RANGE_GPU = _LE_RANGE_CPU.to(device)
     ge_range  = _LE_RANGE_GPU + local_start                       # [E_LOC]
-    valid     = (ge_range >= 0) & (ge_range < _E_GLB)            # [E_LOC]
-    all_match = (topk_idx.unsqueeze(0) == ge_range.view(_E_LOC, 1, 1))  # [E, T, 8]
-    all_sel   = all_match.any(dim=2) & valid.unsqueeze(1)         # [E_LOC, T]
+    # valid is always all-True: local_offset ∈ {0,32,...,224} → ge ∈ [0,255]
+    all_sel   = (topk_idx.unsqueeze(0) == ge_range.view(_E_LOC, 1, 1)).any(dim=2)  # [E, T]
     active    = all_sel.any(dim=1)                                # [E_LOC]
 
     # One sync: get list of active local expert indices
