@@ -1,16 +1,16 @@
 """
-FP8 Block-Scale Fused MoE Kernel  –  v26
+FP8 Block-Scale Fused MoE Kernel  –  v27
 Definition: moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048
 
 v22: geomean ~1.69x
 v25: batch expert selection (broadcast) → geomean ~1.97x
-v26: replace O(T×8×32) broadcast with O(T×8) scatter for expert selection
-  - Old v25: [32, T, 8] broadcast comparison (32× more ops, 8× more memory)
-  - New v26: [T, 8] subtract + scatter → [T, 32] → [32, T]: 32× fewer ops
-  - For large T: saves ~12MB intermediate tensor ([32,T,8]=12.8MB → [T,32]=1.6MB)
+v26/v26b: O(T×8) scatter → ~1.88x (regression, reverted)
+v27: compile the batch selection (broadcast+any+any) → fewer kernel launches
+  - Fuse [32,T,8] comparison + any(dim=2) + mask + any(dim=1) into 1 compiled kernel
+  - Also compile the nonzero step inside the per-expert tok_idx computation
 
 Key techniques (all from v17/v18c):
-1. Expert skipping: O(T×8) scatter finds all active experts, 1 GPU-CPU sync
+1. Expert skipping: compiled batch selection, 1 GPU-CPU sync
 2. view+broadcast per-call dequant (no cache → no ABA)
 3. torch.compile dequant: fp8→fp32 + scale mul fused
 4. torch.compile SwiGLU with dynamic=True: strided loads handle non-contiguous
@@ -53,6 +53,20 @@ def _dequant_W2(W2_fp8: torch.Tensor, S2: torch.Tensor) -> torch.Tensor:
     return (W2_fp8.to(torch.float32)
             .view(_H // _BLKSZ, _BLKSZ, _I // _BLKSZ, _BLKSZ)
             * S2.unsqueeze(1).unsqueeze(3)).view(_H, _I)
+
+
+@torch.compile(fullgraph=True, dynamic=True)
+def _batch_select(
+    topk_idx: torch.Tensor,   # [T, 8]
+    ge_range: torch.Tensor,   # [E_LOC]
+    valid:    torch.Tensor,   # [E_LOC] bool
+):
+    """Fused broadcast+any: returns all_sel [E,T] and active [E] in one compiled kernel."""
+    E = ge_range.shape[0]
+    all_match = (topk_idx.unsqueeze(0) == ge_range.view(E, 1, 1))  # [E, T, 8]
+    all_sel   = all_match.any(dim=2) & valid.unsqueeze(1)           # [E, T]
+    active    = all_sel.any(dim=1)                                  # [E]
+    return all_sel, active
 
 
 @torch.compile(fullgraph=True, dynamic=True)
@@ -130,17 +144,10 @@ def kernel(
     out_f32     = torch.zeros(T, _H, dtype=torch.float32, device=device)
     local_start = int(local_expert_offset)
 
-    # ── Batch expert selection: O(T×8) scatter → 1 GPU-CPU sync ─────────────
-    # local_topk[t, k] = topk_idx[t, k] - local_start  (local expert index)
-    local_topk = topk_idx - local_start                           # [T, 8]
-    in_range   = (local_topk >= 0) & (local_topk < _E_LOC)      # [T, 8]
-
-    # scatter_add_ avoids overwrite bug: out-of-range contribute 0
-    # all_sel_T[t, le] = 1 if token t routes to local expert le
-    all_sel_int = torch.zeros(T, _E_LOC, dtype=torch.int32, device=device)
-    all_sel_int.scatter_add_(1, local_topk.clamp(0, _E_LOC - 1).long(), in_range.int())
-    all_sel    = all_sel_int.bool().t().contiguous()              # [E_LOC, T]
-    active     = all_sel.any(dim=1)                               # [E_LOC]
+    # ── Batch expert selection: compiled broadcast+any → 1 GPU-CPU sync ──────
+    ge_range = torch.arange(_E_LOC, device=device) + local_start  # [E_LOC]
+    valid    = (ge_range >= 0) & (ge_range < _E_GLB)              # [E_LOC]
+    all_sel, active = _batch_select(topk_idx, ge_range, valid)    # [E,T], [E]
 
     # One sync: get list of active local expert indices
     for le in active.nonzero(as_tuple=False).squeeze(1).tolist():
