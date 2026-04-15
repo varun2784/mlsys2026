@@ -1,16 +1,16 @@
 """
-FP8 Block-Scale Fused MoE Kernel  –  v24
+FP8 Block-Scale Fused MoE Kernel  –  v25
 Definition: moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048
 
-v22: geomean ~1.69x (v21/v18c = baseline)
-v24: add dynamic=True to _dequant_A to avoid per-Tk recompilation
-  - Without dynamic, each unique Tk triggers a new specialization;
-    19 workloads × ~8 unique Tk/workload = up to 152 recompiles.
-  - With dynamic=True: single symbolic compilation, amortized across all calls.
-  - Also ensures fullgraph=True still catches any remaining graph breaks.
+v22: geomean ~1.69x
+v24: dynamic=True on _dequant_A → regressed to ~1.47x (reverted)
+v25: batch expert selection to eliminate 32 CPU-GPU syncs → 1
+  - Old: 32 × (topk_idx == ge).any(dim=1).any() → 32 GPU-CPU syncs
+  - New: one [32, T, 8] comparison → active_les.tolist() → 1 GPU-CPU sync
+  - For workloads with few active experts, saves up to 31 spurious syncs.
 
 Key techniques (all from v17/v18c):
-1. Expert skipping: if not sel.any(): continue
+1. Expert skipping: one batched pass finds all active experts
 2. view+broadcast per-call dequant (no cache → no ABA)
 3. torch.compile dequant: fp8→fp32 + scale mul fused
 4. torch.compile SwiGLU with dynamic=True: strided loads handle non-contiguous
@@ -31,9 +31,9 @@ _BLKSZ = 128   # FP8 block-scale granularity
 
 # ─── Compiled fused kernels ───────────────────────────────────────────────────
 
-@torch.compile(fullgraph=True, dynamic=True)
+@torch.compile(fullgraph=True)
 def _dequant_A(A_fp8: torch.Tensor, A_scale: torch.Tensor) -> torch.Tensor:
-    """[Tk, H] fp8 + [Tk, 56] scale → [Tk, H] fp32. dynamic=True: compile once for all Tk."""
+    """[Tk, H] fp8 + [Tk, 56] scale → [Tk, H] fp32. One HBM pass."""
     Tk = A_fp8.shape[0]
     return (A_fp8.to(torch.float32).view(Tk, 56, _BLKSZ)
             * A_scale.unsqueeze(2)).view(Tk, _H)
@@ -130,16 +130,22 @@ def kernel(
     out_f32     = torch.zeros(T, _H, dtype=torch.float32, device=device)
     local_start = int(local_expert_offset)
 
-    for le in range(_E_LOC):
-        ge = local_start + le
-        if ge < 0 or ge >= _E_GLB:
-            continue
+    # ── Batch expert selection: one [E_LOC, T, 8] pass → 1 GPU-CPU sync ──────
+    # Build ge indices for valid local experts
+    le_range = torch.arange(_E_LOC, device=device)
+    ge_range = le_range + local_start                              # [E_LOC]
+    valid    = (ge_range >= 0) & (ge_range < _E_GLB)             # [E_LOC]
 
-        sel = (topk_idx == ge).any(dim=1)
-        if not sel.any():
-            continue
+    # all_sel[le, t] = True if token t routes to expert (local_start + le)
+    # topk_idx: [T, 8] → compare with ge_range [E_LOC, 1, 1]
+    all_match = (topk_idx.unsqueeze(0) == ge_range.view(_E_LOC, 1, 1))  # [E, T, 8]
+    all_sel   = all_match.any(dim=2) & valid.unsqueeze(1)         # [E_LOC, T]
+    active    = all_sel.any(dim=1)                                # [E_LOC]
 
-        tok_idx = sel.nonzero(as_tuple=False).squeeze(1)
+    # One sync: get list of active local expert indices
+    for le in active.nonzero(as_tuple=False).squeeze(1).tolist():
+        ge      = local_start + le
+        tok_idx = all_sel[le].nonzero(as_tuple=False).squeeze(1)
 
         A_fp32   = _dequant_A(hidden_states[tok_idx], A_scale[tok_idx])
         W13_fp32 = _dequant_W13(gemm1_weights[le], gemm1_weights_scale[le])
