@@ -135,10 +135,11 @@ def kernel(
     local_topk = topk_idx - local_start                           # [T, 8]
     in_range   = (local_topk >= 0) & (local_topk < _E_LOC)      # [T, 8]
 
-    # all_sel_T[t, le] = True if token t routes to local expert le
-    all_sel_T  = torch.zeros(T, _E_LOC, dtype=torch.bool, device=device)
-    all_sel_T.scatter_(1, local_topk.clamp(0, _E_LOC - 1).long(), in_range)
-    all_sel    = all_sel_T.t().contiguous()                       # [E_LOC, T]
+    # scatter_add_ avoids overwrite bug: out-of-range contribute 0
+    # all_sel_T[t, le] = 1 if token t routes to local expert le
+    all_sel_int = torch.zeros(T, _E_LOC, dtype=torch.int32, device=device)
+    all_sel_int.scatter_add_(1, local_topk.clamp(0, _E_LOC - 1).long(), in_range.int())
+    all_sel    = all_sel_int.bool().t().contiguous()              # [E_LOC, T]
     active     = all_sel.any(dim=1)                               # [E_LOC]
 
     # One sync: get list of active local expert indices
