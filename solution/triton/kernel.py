@@ -55,7 +55,7 @@ def _swiglu(C_full: torch.Tensor) -> torch.Tensor:
     return (C_up * torch.sigmoid(C_up)) * C_gate
 
 # TF32 fallback dequant kernels
-@torch.compile(fullgraph=True, dynamic=True)
+@torch.compile(fullgraph=True)
 def _dequant_A(A_fp8: torch.Tensor, A_scale: torch.Tensor) -> torch.Tensor:
     Tk = A_fp8.shape[0]
     return (A_fp8.to(torch.float32).view(Tk, 56, _BLKSZ)
