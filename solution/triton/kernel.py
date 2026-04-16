@@ -1,24 +1,25 @@
 """
-FP8 Block-Scale Fused MoE Kernel  –  v30
+FP8 Block-Scale Fused MoE Kernel  –  v29
 Definition: moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048
 
 v22: geomean ~1.69x
 v25: batch expert selection (1 GPU-CPU sync) → geomean ~1.97x
-v28: precomputed _LE_RANGE_GPU → geomean ~2.01x
-v29: remove valid mask (always all-True) → neutral (~2.0x)
-v30: CUDA stream pipelining — overlap W13+W2 dequant for expert i+1
-     with GEMM compute for expert i on the default stream.
-     W13: [4096,7168] fp8 = 28MB; W2: [7168,2048] fp8 = 14MB → 42MB/expert
-     At ~4TB/s HBM: ~10µs per expert hidden in prefetch. For ~20 active experts
-     this hides ~200µs of dequant latency behind GEMM compute.
+v28: precomputed _LE_RANGE_GPU → geomean ~2.01x  ← best so far
+v29: remove valid mask (always all-True: local_offset ∈ {0,32,...,224})
+  - For E_GLB=256, E_LOC=32: ge_range ⊆ [0,255] whenever offset is valid.
+  - Saves one GPU kernel launch ([E,T] AND with all-True bool mask).
 
-Key techniques:
+v30 attempted CUDA stream pipelining but caused memory races:
+  PyTorch's caching allocator doesn't know W13_cur is still in-flight on
+  compute_stream when CPU frees it → prefetch_stream reuses the memory →
+  abs_err ~1e6 on 3/19 workloads. Reverted.
+
+Key techniques (all from v17/v18c):
 1. Expert skipping: one batched broadcast, 1 GPU-CPU sync, no valid mask overhead
 2. view+broadcast per-call dequant (no cache → no ABA)
 3. torch.compile dequant: fp8→fp32 + scale mul fused
 4. torch.compile SwiGLU with dynamic=True: strided loads handle non-contiguous
 5. cuBLAS TF32 GEMMs (tensor cores; Triton WGMMA crashes on B200 Modal)
-6. CUDA stream pipelining: prefetch W13/W2 for next expert while computing current
 """
 
 import torch
@@ -36,9 +37,6 @@ _BLKSZ = 128   # FP8 block-scale granularity
 # Precomputed local expert index range (reused across calls, moved to GPU lazily)
 _LE_RANGE_CPU = torch.arange(_E_LOC)   # [0..31] on CPU
 _LE_RANGE_GPU: torch.Tensor | None = None
-
-# Secondary CUDA stream for prefetching W13/W2 dequant of the next expert
-_PREFETCH_STREAM: torch.cuda.Stream | None = None
 
 # ─── Compiled fused kernels ───────────────────────────────────────────────────
 
@@ -151,51 +149,18 @@ def kernel(
     active    = all_sel.any(dim=1)                                # [E_LOC]
 
     # One sync: get list of active local expert indices
-    active_les = active.nonzero(as_tuple=False).squeeze(1).tolist()
-    n_active   = len(active_les)
-
-    if n_active == 0:
-        _finalize(out_f32, output)
-        return
-
-    # ── CUDA stream pipelining ────────────────────────────────────────────────
-    # Prefetch W13+W2 dequant for expert i+1 on a secondary stream while
-    # computing (GEMM1 + SwiGLU + GEMM2 + accumulate) for expert i on default.
-    global _PREFETCH_STREAM
-    if _PREFETCH_STREAM is None:
-        _PREFETCH_STREAM = torch.cuda.Stream(device=device)
-    prefetch_stream  = _PREFETCH_STREAM
-    compute_stream   = torch.cuda.current_stream(device)
-
-    # Pre-dequant first expert synchronously on default stream
-    le0      = active_les[0]
-    W13_cur  = _dequant_W13(gemm1_weights[le0], gemm1_weights_scale[le0])
-    W2_cur   = _dequant_W2(gemm2_weights[le0],  gemm2_weights_scale[le0])
-
-    for i, le in enumerate(active_les):
-        ge = local_start + le
-
-        # Kick off prefetch for next expert on secondary stream
-        if i + 1 < n_active:
-            next_le = active_les[i + 1]
-            with torch.cuda.stream(prefetch_stream):
-                W13_next = _dequant_W13(gemm1_weights[next_le],
-                                        gemm1_weights_scale[next_le])
-                W2_next  = _dequant_W2(gemm2_weights[next_le],
-                                       gemm2_weights_scale[next_le])
-
-        # Compute on default stream using current expert's weights
+    for le in active.nonzero(as_tuple=False).squeeze(1).tolist():
+        ge      = local_start + le
         tok_idx = all_sel[le].nonzero(as_tuple=False).squeeze(1)
-        A_fp32  = _dequant_A(hidden_states[tok_idx], A_scale[tok_idx])
-        C_full  = torch.mm(A_fp32, W13_cur.t())       # GEMM1: cuBLAS TF32
-        C       = _swiglu(C_full)
-        O       = torch.mm(C, W2_cur.t())             # GEMM2: cuBLAS TF32
-        w_tok   = weights_scaled[tok_idx, ge]
-        out_f32.index_add_(0, tok_idx, O * w_tok.unsqueeze(1))
 
-        # Wait for prefetch to finish, then hand off to next iteration
-        if i + 1 < n_active:
-            compute_stream.wait_stream(prefetch_stream)
-            W13_cur, W2_cur = W13_next, W2_next
+        A_fp32   = _dequant_A(hidden_states[tok_idx], A_scale[tok_idx])
+        W13_fp32 = _dequant_W13(gemm1_weights[le], gemm1_weights_scale[le])
+        C_full   = torch.mm(A_fp32, W13_fp32.t())     # GEMM1: cuBLAS TF32
+        C        = _swiglu(C_full)
+        W2_fp32  = _dequant_W2(gemm2_weights[le], gemm2_weights_scale[le])
+        O        = torch.mm(C, W2_fp32.t())            # GEMM2: cuBLAS TF32
+
+        w_tok = weights_scaled[tok_idx, ge]
+        out_f32.index_add_(0, tok_idx, O * w_tok.unsqueeze(1))
 
     _finalize(out_f32, output)
