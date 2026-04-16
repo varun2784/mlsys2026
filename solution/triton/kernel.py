@@ -5,12 +5,13 @@ Definition: moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048
 v29: ~2.0x geomean on Modal (TF32 GEMMs)
 v31: torch._scaled_mm fp8 GEMMs → RUNTIME_ERROR (non-contig mat2)
 v32: scalar scales + .contiguous() → INCORRECT_NUMERICAL abs_err~1e8 (scalar too coarse)
-v33: rowwise/colwise scales + .contiguous() on mat2:
-  - scale_a: [Tk, 1] per-row of A (max over H-blocks per token)
-  - scale_b: [1, G1] per-col of W13.T (max over H-blocks per G1-block)
-  - GEMM2: quantize C → fp8 with per-row exact scale [Tk, 1] + [1, H] W2 col scale
-  - mat2 forced contiguous (required by cuBLAS fp8 GEMM)
-  - _quantize_fp8 in eager mode (avoids inductor fp8 cast issues)
+v33: rowwise/colwise 2D scales [Tk,1]/[1,G1] → RUNTIME_ERROR
+  PyTorch _scaled_mm expects 1D scale tensors, not 2D!
+  Source: scale_a must be numel()==1 OR 1D tensor of size mat1.size(0).
+v34: fix shapes to 1D:
+  - scale_a: [Tk] (was [Tk, 1])
+  - scale_b: [G1] or [H] (was [1, G1] or [1, H])
+  - _quantize_fp8 returns [Tk] scale (not [Tk, 1])
 """
 
 import torch
@@ -53,12 +54,12 @@ def _swiglu(C_full: torch.Tensor) -> torch.Tensor:
 
 
 def _quantize_fp8(x: torch.Tensor):
-    """fp32 [Tk, N] → (fp8 [Tk, N], per-row scale [Tk, 1]).
-    Eager mode (not compiled) for fp8 cast compatibility."""
-    amax  = x.abs().amax(dim=1, keepdim=True).clamp(min=1e-12)   # [Tk, 1]
+    """fp32 [Tk, N] → (fp8 [Tk, N], per-row scale [Tk]).
+    1D scale tensor for _scaled_mm compatibility. Eager mode (no compile)."""
+    amax  = x.abs().amax(dim=1).clamp(min=1e-12)                  # [Tk]
     scale = amax / _FP8_MAX
-    xq    = (x / scale).clamp(-_FP8_MAX, _FP8_MAX).to(torch.float8_e4m3fn)
-    return xq, scale                                               # [Tk, I], [Tk, 1]
+    xq    = (x / scale.unsqueeze(1)).clamp(-_FP8_MAX, _FP8_MAX).to(torch.float8_e4m3fn)
+    return xq, scale                                               # [Tk, I], [Tk]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -128,14 +129,13 @@ def kernel(
         tok_idx = all_sel[le].nonzero(as_tuple=False).squeeze(1)
 
         # ── GEMM1: A_fp8[Tk,H] @ W13_fp8.T[H,G1] ─────────────────────────
-        # Row-wise A scale: max over H-blocks per token → [Tk, 1]
-        s_a = A_scale[tok_idx].amax(dim=1, keepdim=True)          # [Tk, 1]
-        # Col-wise scale for W13.T [H,G1]: per G1-block, max over H-blocks
+        # Row-wise A scale: max over H-blocks per token → [Tk] (1D required)
+        s_a = A_scale[tok_idx].amax(dim=1)                         # [Tk]
+        # Col-wise scale for W13.T [H,G1]: per G1-block, max over H-blocks → [G1]
         # gemm1_weights_scale[le]: [G1//128, H//128] = [32, 56]
         s_w13 = (gemm1_weights_scale[le]            # [32, 56]
                  .amax(dim=1)                        # [32]
-                 .repeat_interleave(_BLKSZ)          # [G1=4096]
-                 .unsqueeze(0))                      # [1, G1]
+                 .repeat_interleave(_BLKSZ))         # [G1=4096]  1D
 
         # .contiguous() required by cuBLAS fp8 GEMM (non-contig .t() fails)
         W13_T = gemm1_weights[le].t().contiguous()   # [H, G1] fp8
@@ -155,12 +155,11 @@ def kernel(
         C_fp8, s_c = _quantize_fp8(C)               # [Tk, I] fp8, [Tk, 1]
 
         # ── GEMM2: C_fp8[Tk,I] @ W2_fp8.T[I,H] ───────────────────────────
-        # Col-wise scale for W2.T [I,H]: per H-block, max over I-blocks
+        # Col-wise scale for W2.T [I,H]: per H-block, max over I-blocks → [H]
         # gemm2_weights_scale[le]: [H//128, I//128] = [56, 16]
         s_w2 = (gemm2_weights_scale[le]             # [56, 16]
                 .amax(dim=1)                         # [56]
-                .repeat_interleave(_BLKSZ)           # [H=7168]
-                .unsqueeze(0))                       # [1, H]
+                .repeat_interleave(_BLKSZ))          # [H=7168]  1D
 
         W2_T = gemm2_weights[le].t().contiguous()   # [I, H] fp8
 
